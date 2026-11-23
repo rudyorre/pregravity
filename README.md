@@ -29,8 +29,8 @@ A minimal, auditable, zero-dependency Go personal accountability & organization 
 ## Quick Start
 
 ```bash
-# 1. Build & install binary to ~/.local/bin/pregravity
-make install
+# 1. Build & install binary to ~/.local/bin/pregravity (zero C/make dependencies)
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ~/.local/bin/pregravity ./cmd/pregravity
 
 # 2. Initialize config, 0600 env template, data dir, and the /pickup Antigravity skill
 pregravity init
