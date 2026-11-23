@@ -1,0 +1,25 @@
+[Unit]
+Description=Pregravity Personal Accountability & Antigravity Handoff Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/pregravity/env
+ExecStart=%h/.local/bin/pregravity daemon
+Restart=on-failure
+RestartSec=5s
+
+# Strict least-privilege hardening (Pregravity never needs shell or repo write access)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/pregravity
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,12 @@
+# Binaries
+/bin/
+/pregravity
+
+# Local secrets & runtime state
+.env
+*.env
+.pregravity/
+
+# Test / coverage artifacts
+*.out
+coverage.html
