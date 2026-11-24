@@ -33,6 +33,22 @@ func TestReadOnlyFirewall(t *testing.T) {
 			t.Errorf("expected %q to be blocked by read-only firewall", tool.Name)
 		}
 	}
+
+	// Safe-write opt-in allows explicitly allowlisted reversible tools, while STILL banning delete/exec.
+	safeCfg := ServerConfig{
+		Name:            "gtasks",
+		AllowSafeWrites: true,
+		AllowedTools:    []string{"list_tasks", "create_task", "complete_task", "move_task", "delete_task"},
+	}
+	if !IsToolAllowed(Tool{Name: "complete_task"}, safeCfg) || !IsToolAllowed(Tool{Name: "move_task"}, safeCfg) {
+		t.Fatal("expected allowlisted reversible tools to pass in AllowSafeWrites mode")
+	}
+	if IsToolAllowed(Tool{Name: "delete_task"}, safeCfg) {
+		t.Fatal("delete_task must NEVER be allowed even if listed in AllowedTools")
+	}
+	if IsToolAllowed(Tool{Name: "create_something_else"}, safeCfg) {
+		t.Fatal("unlisted tool must be rejected in AllowSafeWrites mode")
+	}
 }
 
 func TestHTTPMCPClientDiscoveryAndCall(t *testing.T) {

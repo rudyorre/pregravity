@@ -2,6 +2,7 @@ package gtasks
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -17,9 +18,24 @@ import (
 	"time"
 )
 
-// ReadonlyScope is the ONLY OAuth scope Pregravity ever requests for Google Tasks.
-// The Google API server itself rejects any write/delete calls made with this token.
-const ReadonlyScope = "https://www.googleapis.com/auth/tasks.readonly"
+const (
+	// ReadonlyScope grants read-only access to Google Tasks.
+	ReadonlyScope = "https://www.googleapis.com/auth/tasks.readonly"
+	// ReadWriteScope grants read+write access to Google Tasks.
+	// Note: Pregravity intentionally NEVER implements DELETE or clear endpoints—
+	// only reversible operations (list, create, complete, reopen, move).
+	ReadWriteScope = "https://www.googleapis.com/auth/tasks"
+)
+
+// SafeWriteToolNames is the exact allowlist of reversible MCP tools exposed in write mode.
+var SafeWriteToolNames = []string{
+	"list_tasklists",
+	"list_tasks",
+	"create_task",
+	"complete_task",
+	"reopen_task",
+	"move_task",
+}
 
 // Credentials matches Google Cloud Desktop OAuth client JSON (installed or web).
 type Credentials struct {
@@ -53,8 +69,22 @@ type TaskItem struct {
 	Notes     string `json:"notes,omitempty"`
 	Status    string `json:"status"` // "needsAction" or "completed"
 	Due       string `json:"due,omitempty"`
+	Parent    string `json:"parent,omitempty"`
+	Position  string `json:"position,omitempty"`
 	Completed string `json:"completed,omitempty"`
 	Updated   string `json:"updated,omitempty"`
+}
+
+// BackupSnapshot captures every list and task (open + completed) before bulk triage.
+type BackupSnapshot struct {
+	CreatedAt time.Time        `json:"created_at"`
+	Lists     []BackupListData `json:"lists"`
+}
+
+// BackupListData pairs a TaskList with all of its tasks.
+type BackupListData struct {
+	List  TaskList   `json:"list"`
+	Tasks []TaskItem `json:"tasks"`
 }
 
 // LoadCredentials loads Google Desktop OAuth JSON (accepting standard {"installed":{...}} or flat JSON).
@@ -98,16 +128,19 @@ func normalizeCreds(c Credentials) Credentials {
 	return c
 }
 
-// AuthURL builds the read-only OAuth consent URL for `pregravity gtasks auth`.
-func AuthURL(c Credentials, redirectURI, state string) string {
+// AuthURL builds the OAuth consent URL for `pregravity gtasks auth`.
+func AuthURL(c Credentials, redirectURI, state, scope string) string {
 	if redirectURI == "" {
 		redirectURI = c.RedirectURI
+	}
+	if scope == "" {
+		scope = ReadWriteScope
 	}
 	v := url.Values{
 		"client_id":     {c.ClientID},
 		"redirect_uri":  {redirectURI},
 		"response_type": {"code"},
-		"scope":         {ReadonlyScope},
+		"scope":         {scope},
 		"access_type":   {"offline"},
 		"prompt":        {"consent"},
 		"state":         {state},
@@ -196,7 +229,8 @@ func LoadToken(path string) (Token, error) {
 	return tok, nil
 }
 
-// Client is a strictly read-only Google Tasks v1 REST client.
+// Client is a non-destructive Google Tasks v1 REST client (supports only read + reversible writes;
+// DELETE and clear are intentionally unimplemented).
 type Client struct {
 	credsPath  string
 	tokenPath  string
@@ -204,7 +238,7 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient constructs a read-only Google Tasks client.
+// NewClient constructs a Google Tasks client.
 func NewClient(credsPath, tokenPath, apiBase string) *Client {
 	if apiBase == "" {
 		apiBase = "https://tasks.googleapis.com/tasks/v1"
@@ -213,7 +247,7 @@ func NewClient(credsPath, tokenPath, apiBase string) *Client {
 		credsPath:  credsPath,
 		tokenPath:  tokenPath,
 		apiBase:    strings.TrimRight(apiBase, "/"),
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		httpClient: &http.Client{Timeout: 20 * time.Second},
 	}
 }
 
@@ -268,68 +302,254 @@ func (c *Client) validAccessToken(ctx context.Context) (string, error) {
 	return tok.AccessToken, nil
 }
 
-func (c *Client) getJSON(ctx context.Context, endpoint string, out any) error {
+func (c *Client) doJSON(ctx context.Context, method, endpoint string, body any, out any) error {
+	// Hard guardrail: never allow HTTP DELETE in this client.
+	if method == http.MethodDelete {
+		return errors.New("DELETE operations are intentionally disabled in pregravity gtasks")
+	}
 	tok, err := c.validAccessToken(ctx)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	var reader io.Reader
+	if body != nil {
+		rawBody, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(rawBody)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("google tasks API HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
+	if out == nil || len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
 	return json.Unmarshal(raw, out)
 }
 
-// ListTaskLists returns the user's Google Task lists (read-only).
+// ListTaskLists returns all of the user's Google Task lists (paginated).
 func (c *Client) ListTaskLists(ctx context.Context) ([]TaskList, error) {
-	var parsed struct {
-		Items []TaskList `json:"items"`
+	var all []TaskList
+	pageToken := ""
+	for {
+		q := url.Values{"maxResults": {"100"}}
+		if pageToken != "" {
+			q.Set("pageToken", pageToken)
+		}
+		var parsed struct {
+			Items         []TaskList `json:"items"`
+			NextPageToken string     `json:"nextPageToken"`
+		}
+		if err := c.doJSON(ctx, http.MethodGet, c.apiBase+"/users/@me/lists?"+q.Encode(), nil, &parsed); err != nil {
+			return nil, err
+		}
+		all = append(all, parsed.Items...)
+		if parsed.NextPageToken == "" {
+			break
+		}
+		pageToken = parsed.NextPageToken
 	}
-	if err := c.getJSON(ctx, c.apiBase+"/users/@me/lists?maxResults=50", &parsed); err != nil {
-		return nil, err
-	}
-	return parsed.Items, nil
+	return all, nil
 }
 
-// ListTasks returns tasks inside tasklistID (defaults to "@default", read-only).
+// ListTasks returns all tasks inside tasklistID (defaults to "@default", paginated).
 func (c *Client) ListTasks(ctx context.Context, tasklistID string, showCompleted bool) ([]TaskItem, error) {
 	if strings.TrimSpace(tasklistID) == "" {
 		tasklistID = "@default"
 	}
-	q := url.Values{
-		"maxResults":    {"100"},
-		"showCompleted": {fmt.Sprintf("%t", showCompleted)},
-		"showHidden":    {"false"},
+	var all []TaskItem
+	pageToken := ""
+	for {
+		q := url.Values{
+			"maxResults":    {"100"},
+			"showCompleted": {fmt.Sprintf("%t", showCompleted)},
+			"showHidden":    {fmt.Sprintf("%t", showCompleted)},
+		}
+		if pageToken != "" {
+			q.Set("pageToken", pageToken)
+		}
+		endpoint := fmt.Sprintf("%s/lists/%s/tasks?%s", c.apiBase, url.PathEscape(tasklistID), q.Encode())
+		var parsed struct {
+			Items         []TaskItem `json:"items"`
+			NextPageToken string     `json:"nextPageToken"`
+		}
+		if err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &parsed); err != nil {
+			return nil, err
+		}
+		all = append(all, parsed.Items...)
+		if parsed.NextPageToken == "" {
+			break
+		}
+		pageToken = parsed.NextPageToken
 	}
-	endpoint := fmt.Sprintf("%s/lists/%s/tasks?%s", c.apiBase, url.PathEscape(tasklistID), q.Encode())
-	var parsed struct {
-		Items []TaskItem `json:"items"`
-	}
-	if err := c.getJSON(ctx, endpoint, &parsed); err != nil {
-		return nil, err
-	}
-	return parsed.Items, nil
+	return all, nil
 }
 
-// ServeStdioMCP runs a zero-dependency, strictly read-only MCP stdio server
-// exposing ONLY `list_tasklists` and `list_tasks` with `readOnlyHint: true`.
-func ServeStdioMCP(ctx context.Context, client *Client, in io.Reader, out io.Writer) error {
+// CreateTaskList creates a new Google Tasks list (e.g. "Someday" or "Archive").
+func (c *Client) CreateTaskList(ctx context.Context, title string) (TaskList, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return TaskList{}, errors.New("task list title cannot be empty")
+	}
+	var created TaskList
+	err := c.doJSON(ctx, http.MethodPost, c.apiBase+"/users/@me/lists", map[string]string{"title": title}, &created)
+	return created, err
+}
+
+// CreateTask creates a new task in tasklistID (defaults to "@default").
+func (c *Client) CreateTask(ctx context.Context, tasklistID, title, notes, due string) (TaskItem, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return TaskItem{}, errors.New("task title cannot be empty")
+	}
+	if strings.TrimSpace(tasklistID) == "" {
+		tasklistID = "@default"
+	}
+	payload := map[string]any{"title": title}
+	if n := strings.TrimSpace(notes); n != "" {
+		payload["notes"] = n
+	}
+	if d := normalizeGoogleDue(due); d != "" {
+		payload["due"] = d
+	}
+	endpoint := fmt.Sprintf("%s/lists/%s/tasks", c.apiBase, url.PathEscape(tasklistID))
+	var created TaskItem
+	err := c.doJSON(ctx, http.MethodPost, endpoint, payload, &created)
+	return created, err
+}
+
+// CompleteTask marks an existing task as completed (reversible in Google Tasks).
+func (c *Client) CompleteTask(ctx context.Context, tasklistID, taskID string) (TaskItem, error) {
+	if strings.TrimSpace(tasklistID) == "" {
+		tasklistID = "@default"
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return TaskItem{}, errors.New("task_id is required")
+	}
+	endpoint := fmt.Sprintf("%s/lists/%s/tasks/%s", c.apiBase, url.PathEscape(tasklistID), url.PathEscape(taskID))
+	var updated TaskItem
+	err := c.doJSON(ctx, http.MethodPatch, endpoint, map[string]any{"status": "completed"}, &updated)
+	return updated, err
+}
+
+// ReopenTask restores a completed task back to needsAction.
+func (c *Client) ReopenTask(ctx context.Context, tasklistID, taskID string) (TaskItem, error) {
+	if strings.TrimSpace(tasklistID) == "" {
+		tasklistID = "@default"
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return TaskItem{}, errors.New("task_id is required")
+	}
+	endpoint := fmt.Sprintf("%s/lists/%s/tasks/%s", c.apiBase, url.PathEscape(tasklistID), url.PathEscape(taskID))
+	var updated TaskItem
+	err := c.doJSON(ctx, http.MethodPatch, endpoint, map[string]any{
+		"status":    "needsAction",
+		"completed": nil,
+	}, &updated)
+	return updated, err
+}
+
+// MoveTask atomically moves taskID from fromTasklistID to destTasklistID using
+// Google Tasks v1 `tasks.move` with `destinationTasklist` (non-destructive, zero DELETE).
+func (c *Client) MoveTask(ctx context.Context, fromTasklistID, taskID, destTasklistID string) (TaskItem, error) {
+	if strings.TrimSpace(fromTasklistID) == "" {
+		fromTasklistID = "@default"
+	}
+	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(destTasklistID) == "" {
+		return TaskItem{}, errors.New("task_id and destination_tasklist_id are required")
+	}
+	q := url.Values{"destinationTasklist": {destTasklistID}}
+	endpoint := fmt.Sprintf("%s/lists/%s/tasks/%s/move?%s",
+		c.apiBase, url.PathEscape(fromTasklistID), url.PathEscape(taskID), q.Encode())
+	var moved TaskItem
+	err := c.doJSON(ctx, http.MethodPost, endpoint, nil, &moved)
+	return moved, err
+}
+
+// BackupAll downloads every task list and all tasks (open + completed) into a local 0600 JSON snapshot.
+func (c *Client) BackupAll(ctx context.Context, backupDir string) (string, BackupSnapshot, error) {
+	lists, err := c.ListTaskLists(ctx)
+	if err != nil {
+		return "", BackupSnapshot{}, err
+	}
+	snap := BackupSnapshot{
+		CreatedAt: time.Now().UTC(),
+		Lists:     make([]BackupListData, 0, len(lists)),
+	}
+	for _, l := range lists {
+		tasks, err := c.ListTasks(ctx, l.ID, true)
+		if err != nil {
+			return "", BackupSnapshot{}, fmt.Errorf("backup list %q (%s): %w", l.Title, l.ID, err)
+		}
+		snap.Lists = append(snap.Lists, BackupListData{List: l, Tasks: tasks})
+	}
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		return "", snap, err
+	}
+	path := filepath.Join(backupDir, fmt.Sprintf("gtasks-%s.json", snap.CreatedAt.Format("20060102-150405")))
+	raw, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return "", snap, err
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		return "", snap, err
+	}
+	return path, snap, nil
+}
+
+func normalizeGoogleDue(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if _, err := time.Parse(time.RFC3339, s); err == nil {
+		return s
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t.UTC().Format(time.RFC3339)
+	}
+	if t, err := time.Parse("2006-01-02 15:04", s); err == nil {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	}
+	return ""
+}
+
+// ServeStdioMCP runs the zero-dependency Google Tasks MCP stdio server.
+// When allowSafeWrites is false, only read-only tools are exposed.
+// When allowSafeWrites is true, reversible non-destructive tools (create, complete, reopen, move) are also exposed.
+// DELETE and clear are NEVER implemented or exposed.
+func ServeStdioMCP(ctx context.Context, client *Client, allowSafeWrites bool, in io.Reader, out io.Writer) error {
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 64<<10), 2<<20)
 	enc := json.NewEncoder(out)
+
+	strArg := func(args map[string]any, k string) string {
+		if args == nil {
+			return ""
+		}
+		if v, ok := args[k]; ok && v != nil {
+			return strings.TrimSpace(fmt.Sprint(v))
+		}
+		return ""
+	}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -345,57 +565,118 @@ func ServeStdioMCP(ctx context.Context, client *Client, in io.Reader, out io.Wri
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			continue
 		}
-		// Notifications have no ID; do not send a response.
 		if len(req.ID) == 0 || string(req.ID) == "null" {
 			continue
 		}
 
 		writeResult := func(res any) {
-			_ = enc.Encode(map[string]any{
-				"jsonrpc": "2.0",
-				"id":      req.ID,
-				"result":  res,
-			})
+			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": res})
 		}
 		writeErr := func(code int, msg string) {
-			_ = enc.Encode(map[string]any{
-				"jsonrpc": "2.0",
-				"id":      req.ID,
-				"error":   map[string]any{"code": code, "message": msg},
-			})
+			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": code, "message": msg}})
+		}
+		writeJSONContent := func(v any, err error) {
+			if err != nil {
+				writeResult(map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": err.Error()}}})
+				return
+			}
+			payload, _ := json.Marshal(v)
+			writeResult(map[string]any{"content": []any{map[string]any{"type": "text", "text": string(payload)}}})
 		}
 
 		switch req.Method {
 		case "initialize":
+			name := "pregravity-gtasks-readonly"
+			if allowSafeWrites {
+				name = "pregravity-gtasks-safewrite"
+			}
 			writeResult(map[string]any{
 				"protocolVersion": "2024-11-05",
 				"capabilities":    map[string]any{"tools": map[string]any{}},
-				"serverInfo":      map[string]any{"name": "pregravity-gtasks-readonly", "version": "1.0"},
+				"serverInfo":      map[string]any{"name": name, "version": "1.1"},
 			})
 
 		case "tools/list":
-			writeResult(map[string]any{
-				"tools": []map[string]any{
-					{
-						"name":        "list_tasklists",
-						"description": "List the user's Google Tasks lists (strictly read-only).",
-						"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-						"annotations": map[string]any{"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
+			tools := []map[string]any{
+				{
+					"name":        "list_tasklists",
+					"description": "List the user's Google Tasks lists (read-only).",
+					"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+					"annotations": map[string]any{"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
+				},
+				{
+					"name":        "list_tasks",
+					"description": "List tasks in a Google Tasks list (read-only). Defaults to '@default'.",
+					"inputSchema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"tasklist_id":    map[string]any{"type": "string", "description": "Google Tasks list ID, or '@default'."},
+							"show_completed": map[string]any{"type": "boolean", "description": "Whether to include completed tasks (default false)."},
+						},
 					},
-					{
-						"name":        "list_tasks",
-						"description": "List tasks in a Google Tasks list (strictly read-only). Defaults to '@default'.",
+					"annotations": map[string]any{"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
+				},
+			}
+			if allowSafeWrites {
+				tools = append(tools,
+					map[string]any{
+						"name":        "create_task",
+						"description": "Create a new task in a Google Tasks list (non-destructive).",
 						"inputSchema": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
-								"tasklist_id":    map[string]any{"type": "string", "description": "Google Tasks list ID, or '@default'."},
-								"show_completed": map[string]any{"type": "boolean", "description": "Whether to include completed tasks (default false)."},
+								"tasklist_id": map[string]any{"type": "string", "description": "Target list ID (defaults to '@default')."},
+								"title":       map[string]any{"type": "string", "description": "Task title."},
+								"notes":       map[string]any{"type": "string", "description": "Optional notes."},
+								"due":         map[string]any{"type": "string", "description": "Optional due date (YYYY-MM-DD or RFC3339)."},
 							},
+							"required": []string{"title"},
 						},
-						"annotations": map[string]any{"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
+						"annotations": map[string]any{"readOnlyHint": false, "destructiveHint": false},
 					},
-				},
-			})
+					map[string]any{
+						"name":        "complete_task",
+						"description": "Mark an existing Google Task as completed (reversible).",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"tasklist_id": map[string]any{"type": "string", "description": "List ID containing the task (defaults to '@default')."},
+								"task_id":     map[string]any{"type": "string", "description": "Google Task ID to complete."},
+							},
+							"required": []string{"task_id"},
+						},
+						"annotations": map[string]any{"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+					},
+					map[string]any{
+						"name":        "reopen_task",
+						"description": "Reopen a completed Google Task back to needsAction.",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"tasklist_id": map[string]any{"type": "string", "description": "List ID containing the task (defaults to '@default')."},
+								"task_id":     map[string]any{"type": "string", "description": "Google Task ID to reopen."},
+							},
+							"required": []string{"task_id"},
+						},
+						"annotations": map[string]any{"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+					},
+					map[string]any{
+						"name":        "move_task",
+						"description": "Move a Google Task from one list to another (non-destructive, atomic).",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"from_tasklist_id": map[string]any{"type": "string", "description": "Current list ID (defaults to '@default')."},
+								"task_id":          map[string]any{"type": "string", "description": "Google Task ID to move."},
+								"to_tasklist_id":   map[string]any{"type": "string", "description": "Destination list ID."},
+							},
+							"required": []string{"task_id", "to_tasklist_id"},
+						},
+						"annotations": map[string]any{"readOnlyHint": false, "destructiveHint": false},
+					},
+				)
+			}
+			writeResult(map[string]any{"tools": tools})
 
 		case "tools/call":
 			var p struct {
@@ -409,26 +690,48 @@ func ServeStdioMCP(ctx context.Context, client *Client, in io.Reader, out io.Wri
 			switch p.Name {
 			case "list_tasklists":
 				lists, err := client.ListTaskLists(ctx)
-				if err != nil {
-					writeResult(map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": err.Error()}}})
-					continue
-				}
-				payload, _ := json.Marshal(map[string]any{"tasklists": lists, "count": len(lists)})
-				writeResult(map[string]any{"content": []any{map[string]any{"type": "text", "text": string(payload)}}})
+				writeJSONContent(map[string]any{"tasklists": lists, "count": len(lists)}, err)
 
 			case "list_tasks":
-				listID := "@default"
-				if v, ok := p.Arguments["tasklist_id"].(string); ok && strings.TrimSpace(v) != "" {
-					listID = v
+				listID := strArg(p.Arguments, "tasklist_id")
+				if listID == "" {
+					listID = "@default"
 				}
 				showDone, _ := p.Arguments["show_completed"].(bool)
 				tasks, err := client.ListTasks(ctx, listID, showDone)
-				if err != nil {
-					writeResult(map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": err.Error()}}})
+				writeJSONContent(map[string]any{"tasklist_id": listID, "tasks": tasks, "count": len(tasks)}, err)
+
+			case "create_task":
+				if !allowSafeWrites {
+					writeErr(-32601, "create_task is disabled in read-only mode")
 					continue
 				}
-				payload, _ := json.Marshal(map[string]any{"tasklist_id": listID, "tasks": tasks, "count": len(tasks)})
-				writeResult(map[string]any{"content": []any{map[string]any{"type": "text", "text": string(payload)}}})
+				t, err := client.CreateTask(ctx, strArg(p.Arguments, "tasklist_id"), strArg(p.Arguments, "title"), strArg(p.Arguments, "notes"), strArg(p.Arguments, "due"))
+				writeJSONContent(map[string]any{"task": t}, err)
+
+			case "complete_task":
+				if !allowSafeWrites {
+					writeErr(-32601, "complete_task is disabled in read-only mode")
+					continue
+				}
+				t, err := client.CompleteTask(ctx, strArg(p.Arguments, "tasklist_id"), strArg(p.Arguments, "task_id"))
+				writeJSONContent(map[string]any{"task": t}, err)
+
+			case "reopen_task":
+				if !allowSafeWrites {
+					writeErr(-32601, "reopen_task is disabled in read-only mode")
+					continue
+				}
+				t, err := client.ReopenTask(ctx, strArg(p.Arguments, "tasklist_id"), strArg(p.Arguments, "task_id"))
+				writeJSONContent(map[string]any{"task": t}, err)
+
+			case "move_task":
+				if !allowSafeWrites {
+					writeErr(-32601, "move_task is disabled in read-only mode")
+					continue
+				}
+				t, err := client.MoveTask(ctx, strArg(p.Arguments, "from_tasklist_id"), strArg(p.Arguments, "task_id"), strArg(p.Arguments, "to_tasklist_id"))
+				writeJSONContent(map[string]any{"task": t}, err)
 
 			default:
 				writeErr(-32601, fmt.Sprintf("unknown or disallowed tool %q", p.Name))

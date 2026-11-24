@@ -579,7 +579,17 @@ func (a *Assistant) executeTool(ctx context.Context, name string, args map[strin
 			if err != nil {
 				return map[string]any{"error": err.Error()}, nil, ""
 			}
-			return res, nil, "🤓"
+			emoji := "🤓"
+			lower := strings.ToLower(name)
+			switch {
+			case strings.Contains(lower, "complete_"):
+				emoji = "🎉"
+			case strings.Contains(lower, "create_"):
+				emoji = "🫡"
+			case strings.Contains(lower, "move_") || strings.Contains(lower, "reopen_"):
+				emoji = "👌"
+			}
+			return res, nil, emoji
 		}
 		return map[string]any{"error": fmt.Sprintf("unknown or disallowed tool %q", name)}, nil, ""
 	}

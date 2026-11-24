@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -108,8 +109,8 @@ Commands:
   tasks           Manage local tasks directly (list | add | done | snooze)
   handoffs        Manage Antigravity handoffs directly (list | create | show | done)
   quota           Show Gemini API usage/freebie quota & Antigravity sub quota (or set-limit <N>)
-  gtasks          Read-only Google Tasks setup & CLI (auth | list | enable)
-  mcp             Run built-in read-only MCP stdio servers (e.g. 'pregravity mcp gtasks')
+  gtasks          Google Tasks CLI & setup (auth | enable | backup | lists | list | create-list | add | complete | reopen | move)
+  mcp             Run built-in MCP stdio servers (e.g. 'pregravity mcp gtasks [--readonly]')
   install-skill   Install the Antigravity /pickup skill to ~/.gemini/config/skills/pickup/
   doctor          Verify config, secret file permissions, data dir, and agy remote-control
   version         Print version`)
@@ -779,7 +780,7 @@ func cmdDoctor(configPath string) error {
 
 func cmdMCP(configPath string, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: pregravity mcp <gtasks>")
+		return errors.New("usage: pregravity mcp gtasks [--readonly]")
 	}
 	if configPath == "" {
 		configPath = config.DefaultConfigPath()
@@ -790,10 +791,15 @@ func cmdMCP(configPath string, args []string) error {
 	}
 	switch args[0] {
 	case "gtasks":
+		fs := flag.NewFlagSet("mcp gtasks", flag.ContinueOnError)
+		readOnly := fs.Bool("readonly", false, "expose only read-only Google Tasks tools")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
 		credsPath := filepath.Join(filepath.Dir(configPath), "gtasks_credentials.json")
 		tokenPath := filepath.Join(cfg.DataDir, "gtasks_token.json")
 		cli := gtasks.NewClient(credsPath, tokenPath, "")
-		return gtasks.ServeStdioMCP(context.Background(), cli, os.Stdin, os.Stdout)
+		return gtasks.ServeStdioMCP(context.Background(), cli, !*readOnly, os.Stdin, os.Stdout)
 	default:
 		return fmt.Errorf("unknown built-in mcp server %q (supported: gtasks)", args[0])
 	}
@@ -809,25 +815,39 @@ func cmdGTasks(configPath string, args []string) error {
 	}
 	credsPath := filepath.Join(filepath.Dir(configPath), "gtasks_credentials.json")
 	tokenPath := filepath.Join(cfg.DataDir, "gtasks_token.json")
+	cli := gtasks.NewClient(credsPath, tokenPath, "")
 
 	sub := "list"
+	var subArgs []string
 	if len(args) > 0 {
 		sub = args[0]
+		subArgs = args[1:]
 	}
 
 	switch sub {
 	case "auth":
+		fs := flag.NewFlagSet("gtasks auth", flag.ContinueOnError)
+		readOnly := fs.Bool("readonly", false, "request tasks.readonly scope instead of reversible tasks read+write scope")
+		if err := fs.Parse(subArgs); err != nil {
+			return err
+		}
 		creds, err := gtasks.LoadCredentials(credsPath)
 		if err != nil {
 			return fmt.Errorf("%w\nDownload a Desktop OAuth Client JSON from Google Cloud Console (enable Google Tasks API) and save it to: %s", err, credsPath)
 		}
+		scope := gtasks.ReadWriteScope
+		scopeLabel := "tasks (reversible writes only — zero DELETE in pregravity)"
+		if *readOnly {
+			scope = gtasks.ReadonlyScope
+			scopeLabel = "tasks.readonly"
+		}
 		state := gtasks.RandomState()
 		redirectURI := "http://127.0.0.1:8789/callback"
-		authURL := gtasks.AuthURL(creds, redirectURI, state)
+		authURL := gtasks.AuthURL(creds, redirectURI, state, scope)
 
-		fmt.Println("Google Tasks Read-Only OAuth Setup (scope: tasks.readonly)")
+		fmt.Printf("Google Tasks OAuth Setup (scope: %s)\n", scopeLabel)
 		fmt.Println("----------------------------------------------------------")
-		fmt.Println("1. Open this URL in your browser and approve read-only access:")
+		fmt.Println("1. Open this URL in your browser and approve access:")
 		fmt.Println()
 		fmt.Println(authURL)
 		fmt.Println()
@@ -842,7 +862,7 @@ func cmdGTasks(configPath string, args []string) error {
 						return
 					}
 					if code := r.URL.Query().Get("code"); code != "" {
-						_, _ = fmt.Fprintln(w, "Pregravity Google Tasks read-only auth complete! You can close this tab.")
+						_, _ = fmt.Fprintln(w, "Pregravity Google Tasks auth complete! You can close this tab.")
 						select {
 						case codeCh <- code:
 						default:
@@ -884,76 +904,244 @@ func cmdGTasks(configPath string, args []string) error {
 		if err := gtasks.SaveToken(tokenPath, tok); err != nil {
 			return err
 		}
-		fmt.Printf("\nSaved read-only Google Tasks token (0600): %s\n", tokenPath)
-		fmt.Println("Next: run `pregravity gtasks enable` to wire the read-only gtasks MCP server into Gravy.")
+		fmt.Printf("\nSaved Google Tasks token (0600): %s\n", tokenPath)
+		fmt.Println("Next: run `pregravity gtasks backup` and `pregravity gtasks enable`")
 		return nil
 
 	case "enable":
+		fs := flag.NewFlagSet("gtasks enable", flag.ContinueOnError)
+		readOnly := fs.Bool("readonly", false, "wire gtasks MCP in strict read-only mode")
+		if err := fs.Parse(subArgs); err != nil {
+			return err
+		}
 		exePath, err := os.Executable()
 		if err != nil {
 			home, _ := os.UserHomeDir()
 			exePath = filepath.Join(home, ".local", "bin", "pregravity")
 		}
+		mcpArgs := []string{"mcp", "gtasks"}
+		allowWrites := !*readOnly
+		var allowedTools []string
+		if *readOnly {
+			mcpArgs = append(mcpArgs, "--readonly")
+			allowedTools = []string{"list_tasklists", "list_tasks"}
+		} else {
+			allowedTools = append([]string(nil), gtasks.SafeWriteToolNames...)
+		}
+
+		ro := *readOnly
+		entry := mcp.ServerConfig{
+			Name:            "gtasks",
+			Enabled:         true,
+			Transport:       "stdio",
+			Command:         exePath,
+			Args:            mcpArgs,
+			ReadOnly:        &ro,
+			AllowSafeWrites: allowWrites,
+			AllowedTools:    allowedTools,
+		}
 		found := false
 		for i := range cfg.MCPServers {
 			if cfg.MCPServers[i].Name == "gtasks" {
-				cfg.MCPServers[i].Enabled = true
-				cfg.MCPServers[i].Transport = "stdio"
-				cfg.MCPServers[i].Command = exePath
-				cfg.MCPServers[i].Args = []string{"mcp", "gtasks"}
+				cfg.MCPServers[i] = entry
 				found = true
 				break
 			}
 		}
 		if !found {
-			ro := true
-			cfg.MCPServers = append(cfg.MCPServers, mcp.ServerConfig{
-				Name:      "gtasks",
-				Enabled:   true,
-				Transport: "stdio",
-				Command:   exePath,
-				Args:      []string{"mcp", "gtasks"},
-				ReadOnly:  &ro,
-			})
+			cfg.MCPServers = append(cfg.MCPServers, entry)
 		}
 		if err := config.Save(configPath, cfg); err != nil {
 			return err
 		}
-		fmt.Printf("Enabled built-in read-only gtasks MCP server in %s\n", configPath)
+		mode := "safe-write (create/complete/reopen/move, zero DELETE)"
+		if *readOnly {
+			mode = "strict read-only"
+		}
+		fmt.Printf("Enabled gtasks MCP server (%s) in %s\n", mode, configPath)
 		fmt.Println("Restart daemon to activate: systemctl --user restart pregravity.service")
 		return nil
 
-	case "list":
-		cli := gtasks.NewClient(credsPath, tokenPath, "")
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	case "backup":
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		backupDir := filepath.Join(cfg.DataDir, "backups")
+		path, snap, err := cli.BackupAll(ctx, backupDir)
+		if err != nil {
+			return err
+		}
+		totalTasks := 0
+		for _, l := range snap.Lists {
+			totalTasks += len(l.Tasks)
+		}
+		fmt.Printf("Backed up %d lists (%d total tasks) -> %s\n", len(snap.Lists), totalTasks, path)
+		return nil
+
+	case "lists":
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		lists, err := cli.ListTaskLists(ctx)
 		if err != nil {
 			return err
 		}
 		for _, l := range lists {
-			fmt.Printf("== %s (%s) ==\n", l.Title, l.ID)
-			items, err := cli.ListTasks(ctx, l.ID, false)
+			fmt.Printf("%-36s  %s\n", l.ID, l.Title)
+		}
+		return nil
+
+	case "list":
+		fs := flag.NewFlagSet("gtasks list", flag.ContinueOnError)
+		listID := fs.String("list", "", "specific tasklist ID (omit to show all lists)")
+		showAll := fs.Bool("all", false, "include completed tasks")
+		asJSON := fs.Bool("json", false, "output structured JSON")
+		if err := fs.Parse(subArgs); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var lists []gtasks.TaskList
+		if strings.TrimSpace(*listID) != "" {
+			lists = []gtasks.TaskList{{ID: *listID, Title: *listID}}
+		} else {
+			lists, err = cli.ListTaskLists(ctx)
 			if err != nil {
-				fmt.Printf("  error: %v\n", err)
+				return err
+			}
+		}
+
+		var out []gtasks.BackupListData
+		for _, l := range lists {
+			items, err := cli.ListTasks(ctx, l.ID, *showAll)
+			if err != nil {
+				return fmt.Errorf("list %q (%s): %w", l.Title, l.ID, err)
+			}
+			out = append(out, gtasks.BackupListData{List: l, Tasks: items})
+		}
+		if *asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(out)
+		}
+		for _, group := range out {
+			fmt.Printf("== %s (%s) [%d] ==\n", group.List.Title, group.List.ID, len(group.Tasks))
+			if len(group.Tasks) == 0 {
+				fmt.Println("  (empty)")
 				continue
 			}
-			if len(items) == 0 {
-				fmt.Println("  (no open tasks)")
-				continue
-			}
-			for _, it := range items {
+			for _, it := range group.Tasks {
+				mark := "[ ]"
+				if it.Status == "completed" {
+					mark = "[x]"
+				}
 				due := ""
 				if it.Due != "" {
-					due = " (due " + it.Due + ")"
+					due = " (due " + strings.Split(it.Due, "T")[0] + ")"
 				}
-				fmt.Printf("  - %s%s\n", it.Title, due)
+				fmt.Printf("  %s %-26s %s%s\n", mark, it.ID, it.Title, due)
+				if strings.TrimSpace(it.Notes) != "" {
+					fmt.Printf("      note: %s\n", firstLine(it.Notes, 120))
+				}
 			}
 		}
 		return nil
 
+	case "create-list":
+		title := strings.TrimSpace(strings.Join(subArgs, " "))
+		if title == "" {
+			return errors.New("usage: pregravity gtasks create-list <title>")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		created, err := cli.CreateTaskList(ctx, title)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Created list %s: %s\n", created.ID, created.Title)
+		return nil
+
+	case "add":
+		fs := flag.NewFlagSet("gtasks add", flag.ContinueOnError)
+		listID := fs.String("list", "@default", "destination tasklist ID")
+		due := fs.String("due", "", "optional due date (YYYY-MM-DD or RFC3339)")
+		notes := fs.String("notes", "", "optional notes")
+		if err := fs.Parse(subArgs); err != nil {
+			return err
+		}
+		title := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if title == "" {
+			return errors.New("usage: pregravity gtasks add [--list ID] [--due YYYY-MM-DD] [--notes '...'] <title>")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		created, err := cli.CreateTask(ctx, *listID, title, *notes, *due)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Created task %s: %s\n", created.ID, created.Title)
+		return nil
+
+	case "complete":
+		fs := flag.NewFlagSet("gtasks complete", flag.ContinueOnError)
+		listID := fs.String("list", "@default", "tasklist ID containing the task(s)")
+		if err := fs.Parse(subArgs); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			return errors.New("usage: pregravity gtasks complete [--list ID] <task-id> [task-id...]")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, id := range fs.Args() {
+			t, err := cli.CompleteTask(ctx, *listID, id)
+			if err != nil {
+				return fmt.Errorf("complete %s: %w", id, err)
+			}
+			fmt.Printf("Completed %s: %s\n", t.ID, t.Title)
+		}
+		return nil
+
+	case "reopen":
+		fs := flag.NewFlagSet("gtasks reopen", flag.ContinueOnError)
+		listID := fs.String("list", "@default", "tasklist ID containing the task")
+		if err := fs.Parse(subArgs); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			return errors.New("usage: pregravity gtasks reopen [--list ID] <task-id>")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		t, err := cli.ReopenTask(ctx, *listID, fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Reopened %s: %s\n", t.ID, t.Title)
+		return nil
+
+	case "move":
+		fs := flag.NewFlagSet("gtasks move", flag.ContinueOnError)
+		fromList := fs.String("from", "@default", "source tasklist ID")
+		toList := fs.String("to", "", "destination tasklist ID (required)")
+		if err := fs.Parse(subArgs); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*toList) == "" || fs.NArg() == 0 {
+			return errors.New("usage: pregravity gtasks move --from <list-id> --to <list-id> <task-id> [task-id...]")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, id := range fs.Args() {
+			t, err := cli.MoveTask(ctx, *fromList, id, *toList)
+			if err != nil {
+				return fmt.Errorf("move %s: %w", id, err)
+			}
+			fmt.Printf("Moved %s (%s) -> %s\n", t.ID, t.Title, *toList)
+		}
+		return nil
+
 	default:
-		return fmt.Errorf("unknown gtasks subcommand %q (expected: auth, enable, list)", sub)
+		return fmt.Errorf("unknown gtasks subcommand %q (expected: auth, enable, backup, lists, list, create-list, add, complete, reopen, move)", sub)
 	}
 }
 

@@ -19,18 +19,21 @@ import (
 )
 
 // ServerConfig configures a single external or built-in MCP server.
-// Pregravity enforces strict read-only filtering on all MCP servers.
+// By default Pregravity enforces strict read-only filtering on all MCP servers.
+// Opting into AllowSafeWrites permits explicitly allowlisted, non-destructive tools
+// (while permanently banning delete/remove/clear/exec/shell verbs everywhere).
 type ServerConfig struct {
-	Name          string            `json:"name"`
-	Enabled       bool              `json:"enabled"`
-	Transport     string            `json:"transport"` // "stdio" or "http"
-	Command       string            `json:"command,omitempty"`
-	Args          []string          `json:"args,omitempty"`
-	URL           string            `json:"url,omitempty"`
-	BearerTokenEv string            `json:"bearer_token_env,omitempty"`
-	ReadOnly      *bool             `json:"read_only,omitempty"` // defaults to true (cannot be disabled in hardened mode)
-	AllowedTools  []string          `json:"allowed_tools,omitempty"`
-	Env           map[string]string `json:"env,omitempty"`
+	Name            string            `json:"name"`
+	Enabled         bool              `json:"enabled"`
+	Transport       string            `json:"transport"` // "stdio" or "http"
+	Command         string            `json:"command,omitempty"`
+	Args            []string          `json:"args,omitempty"`
+	URL             string            `json:"url,omitempty"`
+	BearerTokenEv   string            `json:"bearer_token_env,omitempty"`
+	ReadOnly        *bool             `json:"read_only,omitempty"` // defaults to true
+	AllowSafeWrites bool              `json:"allow_safe_writes,omitempty"`
+	AllowedTools    []string          `json:"allowed_tools,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
 }
 
 // ToolAnnotations follows the MCP tool annotations specification.
@@ -71,6 +74,41 @@ type rpcError struct {
 
 func (e *rpcError) Error() string {
 	return fmt.Sprintf("mcp rpc error (%d): %s", e.Code, e.Message)
+}
+
+// IsToolAllowed evaluates an MCP tool against cfg's security policy.
+// Destructive & shell execution verbs are permanently rejected regardless of config.
+// When AllowSafeWrites is true, an explicit AllowedTools list is required for non-read-only tools.
+func IsToolAllowed(tool Tool, cfg ServerConfig) bool {
+	name := strings.ToLower(strings.TrimSpace(tool.Name))
+	if name == "" {
+		return false
+	}
+	if tool.Annotations != nil && tool.Annotations.DestructiveHint {
+		return false
+	}
+
+	// Permanently banned verbs (never allowed on any MCP server).
+	permanentlyBanned := []string{
+		"delete", "remove", "drop", "destroy", "clear", "purge",
+		"exec", "shell", "bash", "cmd", "run_",
+	}
+	for _, bad := range permanentlyBanned {
+		if strings.Contains(name, bad) {
+			return false
+		}
+	}
+
+	if cfg.AllowSafeWrites && len(cfg.AllowedTools) > 0 {
+		for _, a := range cfg.AllowedTools {
+			if strings.EqualFold(strings.TrimSpace(a), tool.Name) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return IsToolAllowedReadOnly(tool, cfg.AllowedTools)
 }
 
 // IsToolAllowedReadOnly enforces Pregravity's strict read-only firewall on MCP tools.
@@ -348,7 +386,7 @@ func (c *Client) ListReadOnlyTools(ctx context.Context) ([]Tool, error) {
 
 	var allowed []Tool
 	for _, t := range parsed.Tools {
-		if !IsToolAllowedReadOnly(t, c.cfg.AllowedTools) {
+		if !IsToolAllowed(t, c.cfg) {
 			continue
 		}
 		t.Server = c.cfg.Name
