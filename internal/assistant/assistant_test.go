@@ -126,3 +126,49 @@ func TestAssistantToolLoopAndHandoff(t *testing.T) {
 		t.Fatalf("expected disallowed tool to return error, got %+v", res)
 	}
 }
+
+type fallbackMockProvider struct {
+	modelsTried []string
+}
+
+func (f *fallbackMockProvider) Generate(_ context.Context, req gemini.GenerateRequest) (*gemini.GenerateResponse, error) {
+	f.modelsTried = append(f.modelsTried, req.Model)
+	if req.Model == "primary-model" {
+		return nil, &gemini.APIError{Code: 429, Status: "RESOURCE_EXHAUSTED", Message: "daily limit"}
+	}
+	return &gemini.GenerateResponse{
+		Candidates: []struct {
+			Content      gemini.Content `json:"content"`
+			FinishReason string         `json:"finishReason"`
+		}{
+			{Content: gemini.Content{Role: "model", Parts: []gemini.Part{{Text: "Handled by fallback."}}}},
+		},
+		UsageMetadata: &gemini.UsageMetadata{TotalTokenCount: 25},
+	}, nil
+}
+
+func TestAssistantAutomaticFallbackOn429(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.DataDir = dir
+	cfg.Model = "primary-model"
+	cfg.FallbackModels = []string{"fallback-lite"}
+
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	mock := &fallbackMockProvider{}
+	asst := New(cfg, st, mock, nil)
+
+	reply, err := asst.HandleMessage(context.Background(), "cli-fb", "hello")
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got err: %v", err)
+	}
+	if reply.Text != "Handled by fallback." {
+		t.Fatalf("unexpected reply: %q", reply.Text)
+	}
+	if len(mock.modelsTried) != 2 || mock.modelsTried[0] != "primary-model" || mock.modelsTried[1] != "fallback-lite" {
+		t.Fatalf("unexpected model sequence: %v", mock.modelsTried)
+	}
+}

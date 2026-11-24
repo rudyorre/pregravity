@@ -16,6 +16,11 @@ Use this skill when the user invokes `/pickup` or asks to pick up a Pregravity h
 - Tasks snapshot: `~/.local/share/pregravity/TASKS.md`
 - Durable memory: `~/.local/share/pregravity/MEMORY.md`
 
+## Mobile Accessibility & Messenger Convention
+
+- When Pregravity stages a handoff via Telegram (either via `create_handoff` or `/handoff`), it replies directly to the triggering message (`reply_parameters`) with the summary and Antigravity dashboard link, and then sends the `/pickup <id>` command as a **separate, standalone monospace message** (`<code>/pickup <id></code>`) so it can be copied in a single tap on mobile.
+- Keep handoff IDs compact and URL/CLI-safe (`YYYYMMDD-slug-xxxx`) so pasting `/pickup <id>` into Antigravity Remote Control on mobile is effortless.
+
 ## Procedure
 
 1. **Identify the handoff:**

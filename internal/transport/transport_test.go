@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -106,5 +107,57 @@ func TestNotifiers(t *testing.T) {
 	}
 	if !strings.Contains(hookBody, "Top 3 tasks") {
 		t.Fatalf("webhook mismatch: %q", hookBody)
+	}
+}
+
+func TestTelegramSendReplyHTMLFallbackAndReplyParameters(t *testing.T) {
+	var requests []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		requests = append(requests, payload)
+		// Force HTTP 400 on first HTML call when text contains TRIGGER_400 to test plain-text fallback.
+		if txt, _ := payload["text"].(string); strings.Contains(txt, "TRIGGER_400") && payload["parse_mode"] == "HTML" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"ok":false,"description":"Bad Request: can't parse entities"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	bot := &TelegramBot{
+		token:      "test-token",
+		apiBase:    srv.URL,
+		httpClient: srv.Client(),
+	}
+
+	if err := bot.SendReply(context.Background(), 42, 777, "**Bold** and *italic* `code`"); err != nil {
+		t.Fatalf("send reply: %v", err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(requests))
+	}
+	if requests[0]["parse_mode"] != "HTML" {
+		t.Fatalf("expected parse_mode HTML, got %v", requests[0]["parse_mode"])
+	}
+	if requests[0]["text"] != "<b>Bold</b> and <i>italic</i> <code>code</code>" {
+		t.Fatalf("unexpected rendered HTML: %q", requests[0]["text"])
+	}
+	rp, ok := requests[0]["reply_parameters"].(map[string]any)
+	if !ok || int64(rp["message_id"].(float64)) != 777 {
+		t.Fatalf("expected reply_parameters.message_id=777, got %#v", requests[0]["reply_parameters"])
+	}
+
+	// Verify HTTP 400 triggers automatic plain-text fallback.
+	if err := bot.SendReply(context.Background(), 42, 888, "**TRIGGER_400**"); err != nil {
+		t.Fatalf("fallback send reply failed: %v", err)
+	}
+	if len(requests) != 3 {
+		t.Fatalf("expected 2 additional requests (HTML + plain fallback), total=%d", len(requests))
+	}
+	if _, hasParseMode := requests[2]["parse_mode"]; hasParseMode {
+		t.Fatalf("expected fallback retry to omit parse_mode, got %v", requests[2]["parse_mode"])
 	}
 }

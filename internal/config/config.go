@@ -76,6 +76,7 @@ type Config struct {
 	DataDir          string            `json:"data_dir"`
 	Timezone         string            `json:"timezone"`
 	Model            string            `json:"model"`
+	FallbackModels   []string          `json:"fallback_models,omitempty"`
 	APIBaseURL       string            `json:"api_base_url"`
 	MaxHistoryTurns  int               `json:"max_history_turns"`
 	MaxToolRounds    int               `json:"max_tool_rounds"`
@@ -134,6 +135,7 @@ func Default() *Config {
 		DataDir:         DefaultDataDir(),
 		Timezone:        "Local",
 		Model:           "gemini-3.8-flash",
+		FallbackModels:  []string{"gemini-3.1-flash-lite"},
 		APIBaseURL:      "https://generativelanguage.googleapis.com/v1beta",
 		MaxHistoryTurns: 24,
 		MaxToolRounds:   6,

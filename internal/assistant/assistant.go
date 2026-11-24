@@ -99,7 +99,8 @@ func (a *Assistant) HandleMessage(ctx context.Context, sessionID, userText strin
 	}
 
 	for round := 0; round < maxRounds; round++ {
-		resp, err := a.provider.Generate(ctx, gemini.GenerateRequest{
+		resp, usedModel, err := a.generateWithFallback(ctx, gemini.GenerateRequest{
+			Model: a.cfg.Model,
 			SystemInstruction: &gemini.Content{
 				Parts: []gemini.Part{{Text: sysPrompt}},
 			},
@@ -107,10 +108,6 @@ func (a *Assistant) HandleMessage(ctx context.Context, sessionID, userText strin
 			Tools:    tools,
 		})
 		if err != nil {
-			var apiErr *gemini.APIError
-			if errors.As(err, &apiErr) && apiErr.Code == 429 {
-				_ = a.store.RecordAPIUsage(a.cfg.Model, 0, 0, 0, "", true, apiErr.QuotaLimit())
-			}
 			return reply, err
 		}
 		var pTok, oTok, tTok int
@@ -120,7 +117,7 @@ func (a *Assistant) HandleMessage(ctx context.Context, sessionID, userText strin
 			tTok = resp.UsageMetadata.TotalTokenCount
 			reply.Tokens += tTok
 		}
-		_ = a.store.RecordAPIUsage(a.cfg.Model, pTok, oTok, tTok, resp.ServiceTier, false, 0)
+		_ = a.store.RecordAPIUsage(usedModel, pTok, oTok, tTok, resp.ServiceTier, false, 0)
 
 		cand := resp.Candidates[0].Content
 		if cand.Role == "" {
@@ -186,6 +183,41 @@ func (a *Assistant) RunScheduledCheckin(ctx context.Context, scheduleName, promp
 	return a.HandleMessage(ctx, sessionID, prompt)
 }
 
+// generateWithFallback tries the primary model first and automatically falls back
+// through cfg.FallbackModels on 429 RESOURCE_EXHAUSTED or 503 overload errors.
+func (a *Assistant) generateWithFallback(ctx context.Context, req gemini.GenerateRequest) (*gemini.GenerateResponse, string, error) {
+	models := make([]string, 0, 1+len(a.cfg.FallbackModels))
+	models = append(models, a.cfg.Model)
+	for _, fm := range a.cfg.FallbackModels {
+		fm = strings.TrimSpace(fm)
+		if fm != "" && fm != a.cfg.Model {
+			models = append(models, fm)
+		}
+	}
+
+	var lastErr error
+	for i, model := range models {
+		req.Model = model
+		resp, err := a.provider.Generate(ctx, req)
+		if err == nil {
+			return resp, model, nil
+		}
+		lastErr = err
+		var apiErr *gemini.APIError
+		if errors.As(err, &apiErr) {
+			if apiErr.Code == 429 {
+				_ = a.store.RecordAPIUsage(model, 0, 0, 0, "", true, apiErr.QuotaLimit())
+			}
+			if (apiErr.Code == 429 || apiErr.Code == 503) && i+1 < len(models) {
+				a.logger.Warn("model rate-limited or overloaded, trying fallback", "model", model, "fallback", models[i+1], "code", apiErr.Code)
+				continue
+			}
+		}
+		return nil, model, err
+	}
+	return nil, a.cfg.Model, lastErr
+}
+
 func (a *Assistant) buildSystemPrompt() string {
 	loc, err := a.cfg.Location()
 	if err != nil {
@@ -202,7 +234,8 @@ func (a *Assistant) buildSystemPrompt() string {
 	b.WriteString("\nSecurity & Handoff Rules:\n")
 	b.WriteString("- You have NO shell execution and NO access to user source repositories.\n")
 	b.WriteString("- Use your tools to manage tasks, durable memory, daily journal notes, and Antigravity handoffs.\n")
-	b.WriteString("- When the user wants deep coding, debugging, terminal work, or multi-file changes, call `create_handoff` to stage a crisp briefing, then give them the Antigravity link and `/pickup <id>` command.\n")
+	b.WriteString("- Open tasks, pending reminders, and recent handoffs are ALREADY included below—do NOT call list_tasks, list_reminders, or list_handoffs unless you need completed/historical items not shown below (this conserves daily API quota).\n")
+	b.WriteString("- When the user wants deep coding, debugging, terminal work, or multi-file changes, call `create_handoff` to stage a crisp briefing, then give them the Antigravity link and note that the `/pickup <id>` command will be sent right below.\n")
 
 	if mem, err := a.store.ReadMemory(); err == nil && strings.TrimSpace(mem) != "" {
 		b.WriteString("\n--- Durable Memory (MEMORY.md) ---\n")

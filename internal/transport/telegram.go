@@ -119,78 +119,78 @@ func (b *TelegramBot) Run(ctx context.Context) {
 				b.logger.Warn("dropped message from unauthorized telegram chat", "chat_id", chatID)
 				continue
 			}
-			go b.handleMessage(ctx, chatID, u.Message.Text)
+			go b.handleMessage(ctx, chatID, u.Message.MessageID, u.Message.Text)
 		}
 	}
 }
 
-func (b *TelegramBot) handleMessage(ctx context.Context, chatID int64, text string) {
+func (b *TelegramBot) handleMessage(ctx context.Context, chatID, replyToMsgID int64, text string) {
 	text = strings.TrimSpace(text)
 
 	// Fast local slash commands that don't burn API tokens.
 	switch {
 	case text == "/help" || text == "/start":
-		_ = b.SendMessage(ctx, chatID, strings.Join([]string{
-			"Pregravity — Personal Accountability & Antigravity Handoff Assistant",
+		_ = b.SendReply(ctx, chatID, replyToMsgID, strings.Join([]string{
+			"**Pregravity** — Personal Accountability & Antigravity Handoff Assistant",
 			"",
 			"Commands:",
-			"  /tasks — list open tasks (no API tokens)",
-			"  /handoffs — list open Antigravity handoffs",
-			"  /handoff <title> | <goal> — immediately stage a handoff for agy",
-			"  /quota — show Gemini API daily usage & remaining freebie budget (no API tokens)",
-			"  Or just chat normally to track commitments, journal notes, or escalate work.",
+			"- `/tasks` — list open tasks (no API tokens)",
+			"- `/handoffs` — list open Antigravity handoffs",
+			"- `/handoff <title> | <goal>` — immediately stage a handoff for agy",
+			"- `/quota` — show Gemini API daily usage & remaining freebie budget (no API tokens)",
+			"- Or just chat normally to track commitments, journal notes, or escalate work.",
 		}, "\n"))
 		return
 
 	case text == "/quota" || text == "/usage":
 		summary, err := b.st.GetUsageSummary(time.Now(), b.cfg.Model, b.cfg.Quota.LimitForModel(b.cfg.Model))
 		if err != nil {
-			_ = b.SendMessage(ctx, chatID, "Error reading usage: "+err.Error())
+			_ = b.SendReply(ctx, chatID, replyToMsgID, "Error reading usage: "+err.Error())
 			return
 		}
-		msg := store.FormatQuotaReport(summary) + "\n\n(For Antigravity subscription quota, run `pregravity quota` on devbox.)"
-		_ = b.SendMessage(ctx, chatID, msg)
+		msg := store.FormatQuotaReport(summary) + "\n\n_(For Antigravity subscription quota, run `pregravity quota` on devbox.)_"
+		_ = b.SendReply(ctx, chatID, replyToMsgID, msg)
 		return
 
 	case text == "/tasks":
 		tasks, err := b.st.ListTasks("open")
 		if err != nil {
-			_ = b.SendMessage(ctx, chatID, "Error reading tasks: "+err.Error())
+			_ = b.SendReply(ctx, chatID, replyToMsgID, "Error reading tasks: "+err.Error())
 			return
 		}
 		if len(tasks) == 0 {
-			_ = b.SendMessage(ctx, chatID, "No open tasks.")
+			_ = b.SendReply(ctx, chatID, replyToMsgID, "No open tasks.")
 			return
 		}
 		var sb strings.Builder
-		sb.WriteString("Open tasks:\n")
+		sb.WriteString("**Open tasks:**\n")
 		for _, t := range tasks {
 			due := ""
 			if t.Due != "" {
-				due = " (due " + t.Due + ")"
+				due = " *(due " + t.Due + ")*"
 			}
-			fmt.Fprintf(&sb, "• %s [%s] %s%s\n", t.ID, t.Priority, t.Title, due)
+			fmt.Fprintf(&sb, "- `%s` **[%s]** %s%s\n", t.ID, t.Priority, t.Title, due)
 		}
-		_ = b.SendMessage(ctx, chatID, sb.String())
+		_ = b.SendReply(ctx, chatID, replyToMsgID, sb.String())
 		return
 
 	case text == "/handoffs":
 		hs, err := b.st.ListHandoffs("open")
 		if err != nil {
-			_ = b.SendMessage(ctx, chatID, "Error reading handoffs: "+err.Error())
+			_ = b.SendReply(ctx, chatID, replyToMsgID, "Error reading handoffs: "+err.Error())
 			return
 		}
 		if len(hs) == 0 {
-			_ = b.SendMessage(ctx, chatID, "No open Antigravity handoffs.")
+			_ = b.SendReply(ctx, chatID, replyToMsgID, "No open Antigravity handoffs.")
 			return
 		}
 		var sb strings.Builder
-		sb.WriteString("Open Antigravity handoffs:\n")
+		sb.WriteString("**Open Antigravity handoffs:**\n")
 		for _, h := range hs {
-			fmt.Fprintf(&sb, "• %s — %s\n  Run: %s %s\n", h.ID, h.Title, b.cfg.Antigravity.PickupSkill, h.ID)
+			fmt.Fprintf(&sb, "- `%s` — %s\n  `%s %s`\n", h.ID, h.Title, b.cfg.Antigravity.PickupSkill, h.ID)
 		}
-		fmt.Fprintf(&sb, "\nOpen: %s (%s)", b.cfg.Antigravity.DashboardURL, b.cfg.Antigravity.InstanceName)
-		_ = b.SendMessage(ctx, chatID, sb.String())
+		fmt.Fprintf(&sb, "\nOpen: %s (`%s`)", b.cfg.Antigravity.DashboardURL, b.cfg.Antigravity.InstanceName)
+		_ = b.SendReply(ctx, chatID, replyToMsgID, sb.String())
 		return
 
 	case strings.HasPrefix(text, "/handoff "):
@@ -202,12 +202,14 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID int64, text stri
 		}
 		h, err := b.st.CreateHandoff(strings.TrimSpace(title), strings.TrimSpace(goal), "Created manually via Telegram /handoff.", "", nil)
 		if err != nil {
-			_ = b.SendMessage(ctx, chatID, "Could not create handoff: "+err.Error())
+			_ = b.SendReply(ctx, chatID, replyToMsgID, "Could not create handoff: "+err.Error())
 			return
 		}
-		msg := fmt.Sprintf("Handoff staged: %s\nOpen %s (%s) and run:\n%s %s",
-			h.Title, b.cfg.Antigravity.DashboardURL, b.cfg.Antigravity.InstanceName, b.cfg.Antigravity.PickupSkill, h.ID)
-		_ = b.SendMessage(ctx, chatID, msg)
+		msg := fmt.Sprintf("**Handoff staged:** %s\nOpen %s (`%s`) and paste the pickup command below:",
+			h.Title, b.cfg.Antigravity.DashboardURL, b.cfg.Antigravity.InstanceName)
+		_ = b.SendReply(ctx, chatID, replyToMsgID, msg)
+		// Mobile accessibility: send the pickup command as a standalone tap-to-copy message.
+		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("`%s %s`", b.cfg.Antigravity.PickupSkill, h.ID))
 		return
 	}
 
@@ -215,17 +217,23 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID int64, text stri
 	reply, err := b.asst.HandleMessage(ctx, sessionID, text)
 	if err != nil {
 		b.logger.Error("assistant error on telegram message", "chat_id", chatID, "err", err)
-		_ = b.SendMessage(ctx, chatID, "Error: "+err.Error())
+		_ = b.SendReply(ctx, chatID, replyToMsgID, "Error: "+err.Error())
 		return
 	}
-	_ = b.SendMessage(ctx, chatID, reply.Text)
+	_ = b.SendReply(ctx, chatID, replyToMsgID, reply.Text)
+
+	// Mobile accessibility: whenever Grav stages one or more Antigravity handoffs,
+	// follow up with a standalone copy-ready `/pickup <id>` message (one-tap copy on Telegram mobile).
+	for _, h := range reply.Handoffs {
+		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("`%s %s`", b.cfg.Antigravity.PickupSkill, h.ID))
+	}
 }
 
 // Notify implements Notifier by broadcasting scheduled briefings to all allowed chats.
 func (b *TelegramBot) Notify(ctx context.Context, title, body string) error {
 	msg := body
 	if title != "" {
-		msg = fmt.Sprintf("[%s]\n\n%s", title, body)
+		msg = fmt.Sprintf("**%s**\n\n%s", title, body)
 	}
 	var firstErr error
 	for _, id := range b.allowedIDs {
@@ -236,36 +244,71 @@ func (b *TelegramBot) Notify(ctx context.Context, title, body string) error {
 	return firstErr
 }
 
-// SendMessage sends text to chatID, automatically splitting long messages at 3900 chars.
+// SendMessage sends Markdown-formatted text as Telegram HTML (with plain-text fallback).
 func (b *TelegramBot) SendMessage(ctx context.Context, chatID int64, text string) error {
-	chunks := splitChunks(text, 3900)
-	for _, chunk := range chunks {
-		payload := map[string]any{
-			"chat_id":                  chatID,
-			"text":                     chunk,
-			"disable_web_page_preview": true,
+	return b.SendReply(ctx, chatID, 0, text)
+}
+
+// SendReply sends Markdown-formatted text as Telegram HTML, optionally threading
+// a reply to replyToMsgID on the first chunk (and falling back to plain text on HTTP 400).
+func (b *TelegramBot) SendReply(ctx context.Context, chatID, replyToMsgID int64, text string) error {
+	chunks := splitChunks(text, 3500)
+	for i, chunk := range chunks {
+		var replyID int64
+		if i == 0 {
+			replyID = replyToMsgID
 		}
-		raw, err := json.Marshal(payload)
+		htmlChunk := MarkdownToTelegramHTML(chunk)
+		status, err := b.postMessage(ctx, chatID, replyID, htmlChunk, "HTML")
+		if err != nil && status == http.StatusBadRequest {
+			// Safe fallback: if Telegram rejects HTML markup for any edge case, deliver plain text.
+			if b.logger != nil {
+				b.logger.Warn("telegram rejected HTML formatting, retrying plain text", "chat_id", chatID, "err", err)
+			}
+			_, err = b.postMessage(ctx, chatID, replyID, chunk, "")
+		}
 		if err != nil {
 			return err
-		}
-		endpoint := fmt.Sprintf("%s/bot%s/sendMessage", b.apiBase, b.token)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := b.httpClient.Do(req)
-		if err != nil {
-			return err
-		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		resp.Body.Close()
-		if resp.StatusCode >= 300 {
-			return fmt.Errorf("telegram sendMessage returned HTTP %d", resp.StatusCode)
 		}
 	}
 	return nil
+}
+
+func (b *TelegramBot) postMessage(ctx context.Context, chatID, replyToMsgID int64, text, parseMode string) (int, error) {
+	payload := map[string]any{
+		"chat_id":                  chatID,
+		"text":                     text,
+		"disable_web_page_preview": true,
+	}
+	if parseMode != "" {
+		payload["parse_mode"] = parseMode
+	}
+	if replyToMsgID > 0 {
+		payload["reply_parameters"] = map[string]any{
+			"message_id":                replyToMsgID,
+			"allow_sending_without_reply": true,
+		}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", b.apiBase, b.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode >= 300 {
+		return resp.StatusCode, fmt.Errorf("telegram sendMessage returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+	return resp.StatusCode, nil
 }
 
 func (b *TelegramBot) getUpdates(ctx context.Context, offset int64) ([]tgUpdate, error) {

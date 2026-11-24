@@ -55,6 +55,7 @@ type FunctionDeclaration struct {
 
 // GenerateRequest is the payload sent to models/{model}:generateContent.
 type GenerateRequest struct {
+	Model             string    `json:"-"` // Optional per-request override; defaults to Client.model.
 	SystemInstruction *Content  `json:"systemInstruction,omitempty"`
 	Contents          []Content `json:"contents"`
 	Tools             []Tool    `json:"tools,omitempty"`
@@ -157,11 +158,15 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest) (*GenerateRe
 	if c.apiKey == "" {
 		return nil, errors.New("GEMINI_API_KEY is not set (add it to ~/.config/pregravity/env or export GEMINI_API_KEY)")
 	}
-	if c.model == "" {
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = c.model
+	}
+	if model == "" {
 		return nil, errors.New("gemini model is not configured")
 	}
 
-	endpoint := fmt.Sprintf("%s/models/%s:generateContent", c.baseURL, url.PathEscape(c.model))
+	endpoint := fmt.Sprintf("%s/models/%s:generateContent", c.baseURL, url.PathEscape(model))
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
