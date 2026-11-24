@@ -22,6 +22,8 @@ type Content struct {
 // Part represents a single piece of content inside a turn.
 type Part struct {
 	Text             string            `json:"text,omitempty"`
+	Thought          bool              `json:"thought,omitempty"`
+	ThoughtSignature string            `json:"thoughtSignature,omitempty"`
 	FunctionCall     *FunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *FunctionResponse `json:"functionResponse,omitempty"`
 }
@@ -133,36 +135,64 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest) (*GenerateRe
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-goog-api-key", c.apiKey)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * time.Second
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
 
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("call gemini api: %w", err)
-	}
-	defer resp.Body.Close()
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-goog-api-key", c.apiKey)
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read gemini response: %w", err)
-	}
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("call gemini api: %w", err)
+			continue
+		}
 
-	var parsed GenerateResponse
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("decode gemini response (HTTP %d): %w", resp.StatusCode, err)
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("read gemini response: %w", readErr)
+			continue
+		}
+
+		var parsed GenerateResponse
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				lastErr = fmt.Errorf("decode gemini response (HTTP %d): %w", resp.StatusCode, err)
+				continue
+			}
+			return nil, fmt.Errorf("decode gemini response (HTTP %d): %w", resp.StatusCode, err)
+		}
+		if parsed.Error != nil {
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				lastErr = parsed.Error
+				continue
+			}
+			return nil, parsed.Error
+		}
+		if resp.StatusCode >= 400 {
+			err := fmt.Errorf("gemini api returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				lastErr = err
+				continue
+			}
+			return nil, err
+		}
+		if len(parsed.Candidates) == 0 {
+			return nil, errors.New("gemini api returned no candidates")
+		}
+		return &parsed, nil
 	}
-	if parsed.Error != nil {
-		return nil, parsed.Error
-	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("gemini api returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	if len(parsed.Candidates) == 0 {
-		return nil, errors.New("gemini api returned no candidates")
-	}
-	return &parsed, nil
+	return nil, lastErr
 }

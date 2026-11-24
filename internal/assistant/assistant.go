@@ -124,7 +124,7 @@ func (a *Assistant) HandleMessage(ctx context.Context, sessionID, userText strin
 			if p.FunctionCall != nil {
 				calls = append(calls, p.FunctionCall)
 			}
-			if strings.TrimSpace(p.Text) != "" {
+			if !p.Thought && strings.TrimSpace(p.Text) != "" {
 				textParts = append(textParts, p.Text)
 			}
 		}

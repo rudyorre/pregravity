@@ -45,7 +45,9 @@ func TestAssistantToolLoopAndHandoff(t *testing.T) {
 						Content: gemini.Content{
 							Role: "model",
 							Parts: []gemini.Part{
+								{Text: "internal reasoning", Thought: true},
 								{
+									ThoughtSignature: "sig-abc-123",
 									FunctionCall: &gemini.FunctionCall{
 										Name: "add_task",
 										Args: map[string]any{
@@ -101,6 +103,10 @@ func TestAssistantToolLoopAndHandoff(t *testing.T) {
 	}
 	if len(reply.Handoffs) != 1 {
 		t.Fatalf("expected 1 handoff, got %d", len(reply.Handoffs))
+	}
+	// Verify Gemini 3 thoughtSignature was preserved across tool-call rounds.
+	if len(mock.reqs) < 2 || len(mock.reqs[1].Contents) < 2 || mock.reqs[1].Contents[1].Parts[1].ThoughtSignature != "sig-abc-123" {
+		t.Fatalf("expected thoughtSignature to be preserved in round 2 request")
 	}
 
 	tasks, err := st.ListTasks("open")
