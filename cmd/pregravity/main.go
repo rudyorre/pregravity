@@ -294,6 +294,50 @@ func cmdDaemon(configPath string) error {
 		sched.Run(ctx)
 	}()
 
+	// Zero-token due-task and one-shot reminder watcher (checks local store every 30s;
+	// sends direct notifications only when an item enters its lead/due window).
+	lead := time.Duration(cfg.DueLeadMinutes) * time.Minute
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		checkDue := func() {
+			due, err := st.ClaimDueNotifications(time.Now(), loc, lead)
+			if err != nil {
+				logger.Error("due check failed", "err", err)
+				return
+			}
+			for _, d := range due {
+				msg := formatDueNotification(d)
+				logger.Info("firing due notification", "kind", d.Kind, "id", d.ID)
+				_, _ = st.AppendJournal(fmt.Sprintf("[ping:%s] %s", d.ID, msg))
+				// Record into allowed Telegram session(s) so replying directly has context.
+				for _, chatID := range cfg.Telegram.AllowedChatIDs {
+					_ = st.AppendSession(fmt.Sprintf("tg-%d", chatID), store.Message{
+						Role:      "model",
+						Text:      msg,
+						Timestamp: time.Now().UTC(),
+					})
+				}
+				if len(notifiers) > 0 {
+					if err := notifier.Notify(ctx, "", msg); err != nil {
+						logger.Error("due notify failed", "id", d.ID, "err", err)
+					}
+				}
+			}
+		}
+		checkDue()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkDue()
+			}
+		}
+	}()
+
 	<-ctx.Done()
 	logger.Info("shutting down pregravity daemon...")
 	wg.Wait()
@@ -628,6 +672,17 @@ func detectAgyInstanceName() string {
 		return string(m[1])
 	}
 	return ""
+}
+
+func formatDueNotification(d store.DueNotification) string {
+	switch d.Kind {
+	case "task_lead":
+		return fmt.Sprintf("Heads up (%dm): %s [%s] — due %s", d.LeadMin, d.Title, d.ID, d.DueText)
+	case "task_due":
+		return fmt.Sprintf("Due now: %s [%s] (%s) — reply \"done\" when finished or tell me if you're pushing it.", d.Title, d.ID, d.DueText)
+	default:
+		return fmt.Sprintf("Reminder: %s [%s] (%s)", d.Title, d.ID, d.DueText)
+	}
 }
 
 func firstLine(s string, max int) string {

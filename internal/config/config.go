@@ -58,6 +58,7 @@ type Config struct {
 	MaxHistoryTurns  int               `json:"max_history_turns"`
 	MaxToolRounds    int               `json:"max_tool_rounds"`
 	RequestTimeout   int               `json:"request_timeout_sec"`
+	DueLeadMinutes   int               `json:"due_lead_minutes"`
 	Persona          string            `json:"persona"`
 	Antigravity      AntigravityConfig `json:"antigravity"`
 	Telegram         TelegramConfig    `json:"telegram"`
@@ -114,6 +115,7 @@ func Default() *Config {
 		MaxHistoryTurns: 24,
 		MaxToolRounds:   6,
 		RequestTimeout:  45,
+		DueLeadMinutes:  15,
 		Persona:         "You are Pregravity, a sharp, concise personal executive assistant and accountability partner. Keep the user organized, direct, and honest about commitments. Never fabricate tool results. When a request requires code changes, shell access, or deep engineering work, package a clean handoff for Antigravity via create_handoff instead of pretending you can touch the repo.",
 		Antigravity: AntigravityConfig{
 			DashboardURL: "https://antigravity.google.com",

@@ -211,6 +211,13 @@ func (a *Assistant) buildSystemPrompt() string {
 		}
 	}
 
+	if rems, err := a.store.ListReminders(false); err == nil && len(rems) > 0 {
+		b.WriteString("\n--- Pending One-Shot Reminders ---\n")
+		for _, r := range rems {
+			fmt.Fprintf(&b, "- %s at %s: %s\n", r.ID, r.At, r.Message)
+		}
+	}
+
 	if handoffs, err := a.store.ListHandoffs("all"); err == nil && len(handoffs) > 0 {
 		b.WriteString("\n--- Recent Antigravity Handoffs ---\n")
 		limit := len(handoffs)
@@ -263,7 +270,7 @@ func (a *Assistant) toolDeclarations() []gemini.FunctionDeclaration {
 					"title":    map[string]any{"type": "STRING", "description": "Short action-oriented task title."},
 					"notes":    map[string]any{"type": "STRING", "description": "Optional context or acceptance criteria."},
 					"priority": map[string]any{"type": "STRING", "description": "low, medium, or high."},
-					"due":      map[string]any{"type": "STRING", "description": "Optional due date/time (e.g. 2026-11-24 or Friday 5pm)."},
+					"due":      map[string]any{"type": "STRING", "description": "Optional due date/time. For exact timed reminder pings, format as 'YYYY-MM-DD HH:MM' in the user's local timezone."},
 				},
 				"required": []string{"title"},
 			},
@@ -279,6 +286,34 @@ func (a *Assistant) toolDeclarations() []gemini.FunctionDeclaration {
 					"due":      map[string]any{"type": "STRING", "description": "Updated due date/time."},
 					"priority": map[string]any{"type": "STRING", "description": "Updated priority: low, medium, or high."},
 					"notes":    map[string]any{"type": "STRING", "description": "Updated notes."},
+				},
+				"required": []string{"id"},
+			},
+		},
+		{
+			Name:        "set_reminder",
+			Description: "Schedule a one-shot timed ping (zero-token notification) at a specific local date and time.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"message": map[string]any{"type": "STRING", "description": "What to remind the user about."},
+					"at":      map[string]any{"type": "STRING", "description": "Exact time formatted as 'YYYY-MM-DD HH:MM' in the user's local timezone."},
+				},
+				"required": []string{"message", "at"},
+			},
+		},
+		{
+			Name:        "list_reminders",
+			Description: "List pending one-shot reminders.",
+			Parameters:  map[string]any{"type": "OBJECT", "properties": map[string]any{}},
+		},
+		{
+			Name:        "cancel_reminder",
+			Description: "Cancel a pending one-shot reminder by ID.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "STRING", "description": "Reminder ID (e.g. r-a1b2c3)."},
 				},
 				"required": []string{"id"},
 			},
@@ -390,6 +425,30 @@ func (a *Assistant) executeTool(name string, args map[string]any) (map[string]an
 			return map[string]any{"error": err.Error()}, nil
 		}
 		return map[string]any{"task": t}, nil
+
+	case "set_reminder":
+		loc, err := a.cfg.Location()
+		if err != nil {
+			loc = time.Local
+		}
+		r, err := a.store.AddReminder(strArg("message"), strArg("at"), loc)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, nil
+		}
+		return map[string]any{"reminder": r}, nil
+
+	case "list_reminders":
+		rems, err := a.store.ListReminders(false)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, nil
+		}
+		return map[string]any{"reminders": rems, "count": len(rems)}, nil
+
+	case "cancel_reminder":
+		if err := a.store.CancelReminder(strArg("id")); err != nil {
+			return map[string]any{"error": err.Error()}, nil
+		}
+		return map[string]any{"ok": true}, nil
 
 	case "append_memory":
 		if err := a.store.AppendMemory(strArg("entry")); err != nil {

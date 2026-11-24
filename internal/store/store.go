@@ -19,15 +19,36 @@ var safeIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 
 // Task represents a personal commitment or todo tracked by Pregravity.
 type Task struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Notes       string    `json:"notes,omitempty"`
-	Priority    string    `json:"priority"` // low, medium, high
-	Status      string    `json:"status"`   // open, done, snoozed
-	Due         string    `json:"due,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	Notes        string    `json:"notes,omitempty"`
+	Priority     string    `json:"priority"` // low, medium, high
+	Status       string    `json:"status"`   // open, done, snoozed
+	Due          string    `json:"due,omitempty"`
+	NotifiedLead bool      `json:"notified_lead,omitempty"`
+	NotifiedDue  bool      `json:"notified_due,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	CompletedAt  time.Time `json:"completed_at,omitempty"`
+}
+
+// Reminder represents a standalone one-shot timed ping.
+type Reminder struct {
+	ID        string    `json:"id"`
+	Message   string    `json:"message"`
+	At        string    `json:"at"` // YYYY-MM-DD HH:MM (local) or RFC3339
+	Fired     bool      `json:"fired"`
+	CreatedAt time.Time `json:"created_at"`
+	FiredAt   time.Time `json:"fired_at,omitempty"`
+}
+
+// DueNotification is an actionable ping ready to send (zero LLM tokens required).
+type DueNotification struct {
+	Kind    string // "task_lead", "task_due", "reminder"
+	ID      string
+	Title   string
+	DueText string
+	LeadMin int
 }
 
 // Handoff represents a structured escalation packet handed off to Antigravity (agy).
@@ -99,8 +120,9 @@ func (s *Store) MemoryPath() string { return filepath.Join(s.rootDir, "MEMORY.md
 // HandoffsDir returns the directory containing Antigravity handoff briefs.
 func (s *Store) HandoffsDir() string { return filepath.Join(s.rootDir, "handoffs") }
 
-func (s *Store) tasksJSONPath() string { return filepath.Join(s.rootDir, "tasks.json") }
-func (s *Store) tasksMDPath() string   { return filepath.Join(s.rootDir, "TASKS.md") }
+func (s *Store) tasksJSONPath() string     { return filepath.Join(s.rootDir, "tasks.json") }
+func (s *Store) tasksMDPath() string       { return filepath.Join(s.rootDir, "TASKS.md") }
+func (s *Store) remindersJSONPath() string { return filepath.Join(s.rootDir, "reminders.json") }
 
 // safePath ensures rel stays strictly within s.rootDir (prevents path traversal).
 func (s *Store) safePath(elems ...string) (string, error) {
@@ -227,7 +249,12 @@ func (s *Store) UpdateTask(id, status, due, notes, priority string) (Task, error
 			}
 		}
 		if due != "" {
-			tasks[i].Due = strings.TrimSpace(due)
+			newDue := strings.TrimSpace(due)
+			if newDue != tasks[i].Due {
+				tasks[i].Due = newDue
+				tasks[i].NotifiedLead = false
+				tasks[i].NotifiedDue = false
+			}
 		}
 		if notes != "" {
 			tasks[i].Notes = strings.TrimSpace(notes)
@@ -242,6 +269,238 @@ func (s *Store) UpdateTask(id, status, due, notes, priority string) (Task, error
 		return tasks[i], nil
 	}
 	return Task{}, fmt.Errorf("task %q not found", id)
+}
+
+// --- Reminders & Due-Time Notification Engine ---
+
+func (s *Store) loadRemindersLocked() ([]Reminder, error) {
+	raw, err := os.ReadFile(s.remindersJSONPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []Reminder{}, nil
+		}
+		return nil, err
+	}
+	var out []Reminder
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("parse reminders.json: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) saveRemindersLocked(rems []Reminder) error {
+	raw, err := json.MarshalIndent(rems, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(s.remindersJSONPath(), append(raw, '\n'), 0o600)
+}
+
+// ParseLocalTime parses a user/LLM timestamp string in loc (supports RFC3339 and YYYY-MM-DD HH:MM[:SS]).
+func ParseLocalTime(raw string, loc *time.Location) (time.Time, bool) {
+	if loc == nil {
+		loc = time.Local
+	}
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.In(loc), true
+	}
+	layouts := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+	}
+	for _, layout := range layouts {
+		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// AddReminder creates a standalone one-shot reminder at a parseable local timestamp.
+func (s *Store) AddReminder(message, at string, loc *time.Location) (Reminder, error) {
+	message = strings.TrimSpace(message)
+	at = strings.TrimSpace(at)
+	if message == "" {
+		return Reminder{}, errors.New("reminder message cannot be empty")
+	}
+	parsed, ok := ParseLocalTime(at, loc)
+	if !ok {
+		return Reminder{}, fmt.Errorf("invalid reminder time %q (use YYYY-MM-DD HH:MM in local time or RFC3339)", at)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rems, err := s.loadRemindersLocked()
+	if err != nil {
+		return Reminder{}, err
+	}
+	r := Reminder{
+		ID:        "r-" + shortRandHex(3),
+		Message:   message,
+		At:        parsed.Format("2006-01-02 15:04"),
+		Fired:     false,
+		CreatedAt: time.Now().UTC(),
+	}
+	rems = append(rems, r)
+	if err := s.saveRemindersLocked(rems); err != nil {
+		return Reminder{}, err
+	}
+	return r, nil
+}
+
+// ListReminders returns pending (or all) reminders.
+func (s *Store) ListReminders(includeFired bool) ([]Reminder, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rems, err := s.loadRemindersLocked()
+	if err != nil {
+		return nil, err
+	}
+	if includeFired {
+		return rems, nil
+	}
+	out := make([]Reminder, 0, len(rems))
+	for _, r := range rems {
+		if !r.Fired {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// CancelReminder deletes a reminder by ID.
+func (s *Store) CancelReminder(id string) error {
+	id = strings.TrimSpace(id)
+	if !safeIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid reminder id %q", id)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rems, err := s.loadRemindersLocked()
+	if err != nil {
+		return err
+	}
+	out := make([]Reminder, 0, len(rems))
+	found := false
+	for _, r := range rems {
+		if r.ID == id {
+			found = true
+			continue
+		}
+		out = append(out, r)
+	}
+	if !found {
+		return fmt.Errorf("reminder %q not found", id)
+	}
+	return s.saveRemindersLocked(out)
+}
+
+// ClaimDueNotifications atomically finds any open tasks or unfired reminders that
+// have entered their lead-time or due window at `now`, marks them notified so they
+// never fire twice, and returns only newly claimed pings. On idle ticks nothing is written.
+func (s *Store) ClaimDueNotifications(now time.Time, loc *time.Location, lead time.Duration) ([]DueNotification, error) {
+	if loc == nil {
+		loc = time.Local
+	}
+	nowLocal := now.In(loc)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var claimed []DueNotification
+
+	tasks, err := s.loadTasksLocked()
+	if err != nil {
+		return nil, err
+	}
+	tasksDirty := false
+	for i := range tasks {
+		if tasks[i].Status != "open" || tasks[i].Due == "" {
+			continue
+		}
+		dueAt, ok := ParseLocalTime(tasks[i].Due, loc)
+		if !ok {
+			continue
+		}
+		// Exact due time (or overdue and not yet pinged for due).
+		if !nowLocal.Before(dueAt) {
+			if !tasks[i].NotifiedDue {
+				tasks[i].NotifiedDue = true
+				tasks[i].NotifiedLead = true
+				tasksDirty = true
+				claimed = append(claimed, DueNotification{
+					Kind:    "task_due",
+					ID:      tasks[i].ID,
+					Title:   tasks[i].Title,
+					DueText: dueAt.Format("15:04 MST"),
+				})
+			}
+			continue
+		}
+		// Lead-time heads-up window (e.g. 15m before due).
+		if lead > 0 && !tasks[i].NotifiedLead && !nowLocal.Before(dueAt.Add(-lead)) {
+			tasks[i].NotifiedLead = true
+			tasksDirty = true
+			mins := int(dueAt.Sub(nowLocal).Round(time.Minute) / time.Minute)
+			if mins < 1 {
+				mins = 1
+			}
+			claimed = append(claimed, DueNotification{
+				Kind:    "task_lead",
+				ID:      tasks[i].ID,
+				Title:   tasks[i].Title,
+				DueText: dueAt.Format("15:04 MST"),
+				LeadMin: mins,
+			})
+		}
+	}
+	if tasksDirty {
+		if err := s.saveTasksLocked(tasks); err != nil {
+			return nil, err
+		}
+	}
+
+	rems, err := s.loadRemindersLocked()
+	if err != nil {
+		return nil, err
+	}
+	remsDirty := false
+	for i := range rems {
+		if rems[i].Fired {
+			continue
+		}
+		at, ok := ParseLocalTime(rems[i].At, loc)
+		if !ok {
+			continue
+		}
+		if !nowLocal.Before(at) {
+			rems[i].Fired = true
+			rems[i].FiredAt = now.UTC()
+			remsDirty = true
+			claimed = append(claimed, DueNotification{
+				Kind:    "reminder",
+				ID:      rems[i].ID,
+				Title:   rems[i].Message,
+				DueText: at.Format("15:04 MST"),
+			})
+		}
+	}
+	if remsDirty {
+		if err := s.saveRemindersLocked(rems); err != nil {
+			return nil, err
+		}
+	}
+
+	return claimed, nil
 }
 
 // --- Memory & Journal ---

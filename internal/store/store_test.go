@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStoreTasksMemoryJournalAndHandoffs(t *testing.T) {
@@ -85,5 +86,71 @@ func TestStoreRejectsPathTraversal(t *testing.T) {
 	}
 	if _, err := st.UpdateTask("../bad", "done", "", "", ""); err == nil {
 		t.Fatal("expected traversal task id to be rejected")
+	}
+}
+
+func TestClaimDueNotificationsLeadDueRescheduleAndReminders(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	loc := time.FixedZone("PST", -8*3600)
+
+	// Task due at 17:30 local, plus a fuzzy-due task that should be safely ignored.
+	task, err := st.AddTask("Drop off TV in SF", "", "medium", "2026-11-23 17:30:00")
+	if err != nil {
+		t.Fatalf("add task: %v", err)
+	}
+	if _, err := st.AddTask("Someday task", "", "low", "next friday"); err != nil {
+		t.Fatalf("add fuzzy task: %v", err)
+	}
+	rem, err := st.AddReminder("Grab keys", "2026-11-23 17:20", loc)
+	if err != nil {
+		t.Fatalf("add reminder: %v", err)
+	}
+
+	lead := 15 * time.Minute
+
+	// 17:10 -> nothing due yet
+	got, err := st.ClaimDueNotifications(time.Date(2026, 11, 23, 17, 10, 0, 0, loc), loc, lead)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("expected 0 notifications at 17:10, got %+v err=%v", got, err)
+	}
+
+	// 17:15 -> task lead-time fires once
+	got, err = st.ClaimDueNotifications(time.Date(2026, 11, 23, 17, 15, 0, 0, loc), loc, lead)
+	if err != nil || len(got) != 1 || got[0].Kind != "task_lead" || got[0].ID != task.ID {
+		t.Fatalf("expected task_lead at 17:15, got %+v err=%v", got, err)
+	}
+	// 17:16 -> no duplicate lead ping
+	got, err = st.ClaimDueNotifications(time.Date(2026, 11, 23, 17, 16, 0, 0, loc), loc, lead)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("expected no duplicate at 17:16, got %+v err=%v", got, err)
+	}
+
+	// 17:20 -> standalone reminder fires once
+	got, err = st.ClaimDueNotifications(time.Date(2026, 11, 23, 17, 20, 0, 0, loc), loc, lead)
+	if err != nil || len(got) != 1 || got[0].Kind != "reminder" || got[0].ID != rem.ID {
+		t.Fatalf("expected reminder at 17:20, got %+v err=%v", got, err)
+	}
+
+	// 17:30 -> exact due-time fires once
+	got, err = st.ClaimDueNotifications(time.Date(2026, 11, 23, 17, 30, 0, 0, loc), loc, lead)
+	if err != nil || len(got) != 1 || got[0].Kind != "task_due" || got[0].ID != task.ID {
+		t.Fatalf("expected task_due at 17:30, got %+v err=%v", got, err)
+	}
+	// 17:31 -> no duplicate due ping
+	got, err = st.ClaimDueNotifications(time.Date(2026, 11, 23, 17, 31, 0, 0, loc), loc, lead)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("expected no duplicate at 17:31, got %+v err=%v", got, err)
+	}
+
+	// Rescheduling due date resets notification flags so it pings again at the new time.
+	if _, err := st.UpdateTask(task.ID, "", "2026-11-23 18:00", "", ""); err != nil {
+		t.Fatalf("reschedule: %v", err)
+	}
+	got, err = st.ClaimDueNotifications(time.Date(2026, 11, 23, 18, 0, 0, 0, loc), loc, lead)
+	if err != nil || len(got) != 1 || got[0].Kind != "task_due" {
+		t.Fatalf("expected rescheduled task_due at 18:00, got %+v err=%v", got, err)
 	}
 }
