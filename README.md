@@ -1,4 +1,6 @@
-# Pregravity
+<p align="center">
+  <img src="assets/pregravity-wordmark-transparent.png" alt="pregravity" width="420" />
+</p>
 
 A minimal, auditable, zero-dependency Go personal accountability & organization daemon designed to run 24/7 on your devbox and hand off deep engineering work cleanly to **Google Antigravity (`agy`)**.
 
