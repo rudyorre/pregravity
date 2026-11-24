@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -61,6 +62,8 @@ func main() {
 		err = cmdTasks(configPath, subArgs)
 	case "handoffs":
 		err = cmdHandoffs(configPath, subArgs)
+	case "quota", "usage":
+		err = cmdQuota(configPath, subArgs)
 	case "install-skill":
 		err = cmdInstallSkill()
 	case "doctor":
@@ -95,6 +98,7 @@ Commands:
   chat            Interactive terminal chat (or one-shot with -p "...")
   tasks           Manage local tasks directly (list | add | done | snooze)
   handoffs        Manage Antigravity handoffs directly (list | create | show | done)
+  quota           Show Gemini API usage/freebie quota & Antigravity sub quota (or set-limit <N>)
   install-skill   Install the Antigravity /pickup skill to ~/.gemini/config/skills/pickup/
   doctor          Verify config, secret file permissions, data dir, and agy remote-control
   version         Print version`)
@@ -237,7 +241,7 @@ func cmdDaemon(configPath string) error {
 	}
 
 	if cfg.HTTP.Enabled {
-		srv, err := transport.NewHTTPServer(cfg.HTTP.Listen, cfg.HTTPToken, st, asst)
+		srv, err := transport.NewHTTPServer(cfg.HTTP.Listen, cfg.HTTPToken, cfg, st, asst)
 		if err != nil {
 			return fmt.Errorf("init http api: %w", err)
 		}
@@ -583,6 +587,93 @@ func cmdHandoffs(configPath string, args []string) error {
 	default:
 		return fmt.Errorf("unknown handoffs subcommand %q (expected: list, create, show, done)", sub)
 	}
+}
+
+func cmdQuota(configPath string, args []string) error {
+	if configPath == "" {
+		configPath = config.DefaultConfigPath()
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+
+	if len(args) > 0 && args[0] == "set-limit" {
+		if len(args) < 2 {
+			return errors.New("usage: pregravity quota set-limit <daily-request-limit> [model]")
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(args[1]))
+		if err != nil || n < 0 {
+			return fmt.Errorf("invalid daily request limit %q (expected non-negative integer)", args[1])
+		}
+		targetModel := cfg.Model
+		if len(args) >= 3 && strings.TrimSpace(args[2]) != "" {
+			targetModel = strings.TrimSpace(args[2])
+		}
+		if cfg.Quota.ModelDailyLimits == nil {
+			cfg.Quota.ModelDailyLimits = map[string]int{}
+		}
+		cfg.Quota.ModelDailyLimits[targetModel] = n
+		if err := config.Save(configPath, cfg); err != nil {
+			return err
+		}
+		fmt.Printf("Saved daily request limit for %s: %d/day (%s)\n", targetModel, n, configPath)
+		return nil
+	}
+
+	fs := flag.NewFlagSet("quota", flag.ContinueOnError)
+	apiOnly := fs.Bool("api-only", false, "only show Gemini API usage (skip agy subscription check)")
+	subOnly := fs.Bool("sub-only", false, "only show Antigravity subscription quota")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if !*subOnly {
+		st, err := store.Open(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		summary, err := st.GetUsageSummary(time.Now(), cfg.Model, cfg.Quota.LimitForModel(cfg.Model))
+		if err != nil {
+			return err
+		}
+		fmt.Println(store.FormatQuotaReport(summary))
+	}
+
+	if !*apiOnly {
+		if !*subOnly {
+			fmt.Println()
+		}
+		fmt.Println("Antigravity Subscription Quota (via `agy -p /usage`)")
+		fmt.Println("----------------------------------------------------")
+		out, err := fetchAgySubQuota()
+		if err != nil {
+			fmt.Printf("Unavailable (%v)\n", err)
+		} else {
+			fmt.Println(strings.TrimSpace(out))
+		}
+	}
+	return nil
+}
+
+func fetchAgySubQuota() (string, error) {
+	agyBin, err := exec.LookPath("agy")
+	if err != nil {
+		home, _ := os.UserHomeDir()
+		candidate := filepath.Join(home, ".local", "bin", "agy")
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			agyBin = candidate
+		} else {
+			return "", errors.New("agy binary not found")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, agyBin, "-p", "/usage", "--print-timeout", "8s").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
 }
 
 func cmdDoctor(configPath string) error {

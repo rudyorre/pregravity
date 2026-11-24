@@ -49,6 +49,28 @@ type AntigravityConfig struct {
 	PickupSkill  string `json:"pickup_skill"`
 }
 
+// QuotaConfig controls client-side Gemini API free-tier / daily budget tracking.
+// Google's Gemini API does not expose remaining RPD in response headers; enter
+// your live cap from https://aistudio.google.com/rate-limit (or via `pregravity quota set-limit <N>`).
+type QuotaConfig struct {
+	DailyRequestLimit int            `json:"daily_request_limit"`
+	ModelDailyLimits  map[string]int `json:"model_daily_limits,omitempty"`
+	WarnAtPercent     int            `json:"warn_at_percent"`
+}
+
+// LimitForModel returns the configured daily request limit for model (0 if unset).
+func (q QuotaConfig) LimitForModel(model string) int {
+	if q.ModelDailyLimits != nil {
+		if v := q.ModelDailyLimits[model]; v > 0 {
+			return v
+		}
+	}
+	if q.DailyRequestLimit > 0 {
+		return q.DailyRequestLimit
+	}
+	return 0
+}
+
 // Config is the top-level Pregravity configuration.
 type Config struct {
 	DataDir          string            `json:"data_dir"`
@@ -60,6 +82,7 @@ type Config struct {
 	RequestTimeout   int               `json:"request_timeout_sec"`
 	DueLeadMinutes   int               `json:"due_lead_minutes"`
 	Persona          string            `json:"persona"`
+	Quota            QuotaConfig       `json:"quota"`
 	Antigravity      AntigravityConfig `json:"antigravity"`
 	Telegram         TelegramConfig    `json:"telegram"`
 	Notify           NotifyConfig      `json:"notify"`
@@ -117,6 +140,11 @@ func Default() *Config {
 		RequestTimeout:  45,
 		DueLeadMinutes:  15,
 		Persona:         "You are Pregravity, a sharp, concise personal executive assistant and accountability partner. Keep the user organized, direct, and honest about commitments. Never fabricate tool results. When a request requires code changes, shell access, or deep engineering work, package a clean handoff for Antigravity via create_handoff instead of pretending you can touch the repo.",
+		Quota: QuotaConfig{
+			DailyRequestLimit: 0,
+			ModelDailyLimits:  map[string]int{},
+			WarnAtPercent:     80,
+		},
 		Antigravity: AntigravityConfig{
 			DashboardURL: "https://antigravity.google.com",
 			InstanceName: "devbox",

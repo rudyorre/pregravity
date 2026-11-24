@@ -137,8 +137,19 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID int64, text stri
 			"  /tasks — list open tasks (no API tokens)",
 			"  /handoffs — list open Antigravity handoffs",
 			"  /handoff <title> | <goal> — immediately stage a handoff for agy",
+			"  /quota — show Gemini API daily usage & remaining freebie budget (no API tokens)",
 			"  Or just chat normally to track commitments, journal notes, or escalate work.",
 		}, "\n"))
+		return
+
+	case text == "/quota" || text == "/usage":
+		summary, err := b.st.GetUsageSummary(time.Now(), b.cfg.Model, b.cfg.Quota.LimitForModel(b.cfg.Model))
+		if err != nil {
+			_ = b.SendMessage(ctx, chatID, "Error reading usage: "+err.Error())
+			return
+		}
+		msg := store.FormatQuotaReport(summary) + "\n\n(For Antigravity subscription quota, run `pregravity quota` on devbox.)"
+		_ = b.SendMessage(ctx, chatID, msg)
 		return
 
 	case text == "/tasks":

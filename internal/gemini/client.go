@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -67,6 +68,7 @@ type GenerateResponse struct {
 	} `json:"candidates"`
 	UsageMetadata *UsageMetadata `json:"usageMetadata,omitempty"`
 	Error         *APIError      `json:"error,omitempty"`
+	ServiceTier   string         `json:"-"`
 }
 
 // UsageMetadata records token counts reported by the Gemini API.
@@ -78,13 +80,43 @@ type UsageMetadata struct {
 
 // APIError is an error payload returned by the Gemini REST API.
 type APIError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Status  string `json:"status"`
+	Code    int              `json:"code"`
+	Message string           `json:"message"`
+	Status  string           `json:"status"`
+	Details []map[string]any `json:"details,omitempty"`
 }
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("gemini api error (%d %s): %s", e.Code, e.Status, e.Message)
+}
+
+// QuotaLimit extracts a numeric daily quotaValue if Google returned a QuotaFailure detail on 429.
+func (e *APIError) QuotaLimit() int {
+	if e == nil {
+		return 0
+	}
+	for _, d := range e.Details {
+		violations, ok := d["violations"].([]any)
+		if !ok {
+			continue
+		}
+		for _, v := range violations {
+			m, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			qid, _ := m["quotaId"].(string)
+			if qid != "" && !strings.Contains(strings.ToLower(qid), "day") {
+				continue
+			}
+			if rawVal, ok := m["quotaValue"].(string); ok {
+				if n, err := strconv.Atoi(strings.TrimSpace(rawVal)); err == nil && n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 0
 }
 
 // Provider is the minimal interface used by Assistant (easy to mock in tests).
@@ -192,6 +224,7 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest) (*GenerateRe
 		if len(parsed.Candidates) == 0 {
 			return nil, errors.New("gemini api returned no candidates")
 		}
+		parsed.ServiceTier = strings.TrimSpace(resp.Header.Get("x-gemini-service-tier"))
 		return &parsed, nil
 	}
 	return nil, lastErr

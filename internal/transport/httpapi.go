@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"pregravity/internal/assistant"
+	"pregravity/internal/config"
 	"pregravity/internal/store"
 )
 
@@ -17,19 +18,21 @@ import (
 type HTTPServer struct {
 	addr  string
 	token string
+	cfg   *config.Config
 	st    *store.Store
 	asst  *assistant.Assistant
 	srv   *http.Server
 }
 
 // NewHTTPServer builds a hardened loopback HTTPServer.
-func NewHTTPServer(addr, token string, st *store.Store, asst *assistant.Assistant) (*HTTPServer, error) {
+func NewHTTPServer(addr, token string, cfg *config.Config, st *store.Store, asst *assistant.Assistant) (*HTTPServer, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("PREGRAVITY_HTTP_TOKEN must be set when http.enabled is true")
 	}
 	h := &HTTPServer{
 		addr:  addr,
 		token: token,
+		cfg:   cfg,
 		st:    st,
 		asst:  asst,
 	}
@@ -37,6 +40,7 @@ func NewHTTPServer(addr, token string, st *store.Store, asst *assistant.Assistan
 	mux.HandleFunc("GET /health", h.handleHealth)
 	mux.HandleFunc("GET /tasks", h.requireAuth(h.handleListTasks))
 	mux.HandleFunc("GET /handoffs", h.requireAuth(h.handleListHandoffs))
+	mux.HandleFunc("GET /quota", h.requireAuth(h.handleQuota))
 	mux.HandleFunc("POST /chat", h.requireAuth(h.handleChat))
 
 	h.srv = &http.Server{
@@ -107,6 +111,21 @@ func (h *HTTPServer) handleListHandoffs(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"handoffs": hs})
+}
+
+func (h *HTTPServer) handleQuota(w http.ResponseWriter, _ *http.Request) {
+	model := ""
+	limit := 0
+	if h.cfg != nil {
+		model = h.cfg.Model
+		limit = h.cfg.Quota.LimitForModel(model)
+	}
+	summary, err := h.st.GetUsageSummary(time.Now(), model, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
 }
 
 func (h *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {

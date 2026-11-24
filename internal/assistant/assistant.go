@@ -2,6 +2,7 @@ package assistant
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -106,11 +107,20 @@ func (a *Assistant) HandleMessage(ctx context.Context, sessionID, userText strin
 			Tools:    tools,
 		})
 		if err != nil {
+			var apiErr *gemini.APIError
+			if errors.As(err, &apiErr) && apiErr.Code == 429 {
+				_ = a.store.RecordAPIUsage(a.cfg.Model, 0, 0, 0, "", true, apiErr.QuotaLimit())
+			}
 			return reply, err
 		}
+		var pTok, oTok, tTok int
 		if resp.UsageMetadata != nil {
-			reply.Tokens += resp.UsageMetadata.TotalTokenCount
+			pTok = resp.UsageMetadata.PromptTokenCount
+			oTok = resp.UsageMetadata.CandidatesTokenCount
+			tTok = resp.UsageMetadata.TotalTokenCount
+			reply.Tokens += tTok
 		}
+		_ = a.store.RecordAPIUsage(a.cfg.Model, pTok, oTok, tTok, resp.ServiceTier, false, 0)
 
 		cand := resp.Candidates[0].Content
 		if cand.Role == "" {
@@ -365,6 +375,11 @@ func (a *Assistant) toolDeclarations() []gemini.FunctionDeclaration {
 				},
 			},
 		},
+		{
+			Name:        "get_quota",
+			Description: "Get Pregravity's locally tracked Gemini API daily request/token usage, remaining free-tier budget, and time until midnight PT reset.",
+			Parameters:  map[string]any{"type": "OBJECT", "properties": map[string]any{}},
+		},
 	}
 }
 
@@ -487,6 +502,13 @@ func (a *Assistant) executeTool(name string, args map[string]any) (map[string]an
 			return map[string]any{"error": err.Error()}, nil
 		}
 		return map[string]any{"handoffs": hs, "count": len(hs)}, nil
+
+	case "get_quota":
+		summary, err := a.store.GetUsageSummary(time.Now(), a.cfg.Model, a.cfg.Quota.LimitForModel(a.cfg.Model))
+		if err != nil {
+			return map[string]any{"error": err.Error()}, nil
+		}
+		return map[string]any{"quota": summary}, nil
 
 	default:
 		return map[string]any{"error": fmt.Sprintf("unknown or disallowed tool %q", name)}, nil

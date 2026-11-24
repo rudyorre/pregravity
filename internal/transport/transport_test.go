@@ -36,7 +36,7 @@ func TestHTTPAPIAuthAndEndpoints(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	asst := assistant.New(cfg, st, staticProvider{reply: "roger that"}, nil)
-	srv, err := NewHTTPServer("127.0.0.1:0", "topsecret", st, asst)
+	srv, err := NewHTTPServer("127.0.0.1:0", "topsecret", cfg, st, asst)
 	if err != nil {
 		t.Fatalf("new http server: %v", err)
 	}
