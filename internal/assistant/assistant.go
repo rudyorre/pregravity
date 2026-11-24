@@ -11,6 +11,7 @@ import (
 
 	"pregravity/internal/config"
 	"pregravity/internal/gemini"
+	"pregravity/internal/mcp"
 	"pregravity/internal/store"
 )
 
@@ -19,6 +20,7 @@ type Reply struct {
 	Text      string
 	ToolCalls []string
 	Handoffs  []store.Handoff
+	Reaction  string // Suggested Telegram reaction emoji based on turn outcome (zero extra tokens)
 	Tokens    int
 }
 
@@ -28,11 +30,17 @@ type Assistant struct {
 	cfg      *config.Config
 	store    *store.Store
 	provider gemini.Provider
+	mcpMgr   *mcp.Manager
 	logger   *slog.Logger
 
 	// Per-session mutex to prevent interleaved turns on the same thread.
 	sessMu sync.Mutex
 	locks  map[string]*sync.Mutex
+}
+
+// SetMCPManager attaches a read-only MCP manager to expose vetted external tools.
+func (a *Assistant) SetMCPManager(m *mcp.Manager) {
+	a.mcpMgr = m
 }
 
 // New creates an Assistant.
@@ -141,15 +149,16 @@ func (a *Assistant) HandleMessage(ctx context.Context, sessionID, userText strin
 			break
 		}
 
-		// Execute strictly whitelisted, shell-free tools.
+		// Execute strictly whitelisted, shell-free tools (plus vetted read-only MCP tools).
 		respParts := make([]gemini.Part, 0, len(calls))
 		for _, fc := range calls {
 			reply.ToolCalls = append(reply.ToolCalls, fc.Name)
 			a.logger.Info("executing tool", "session", sessionID, "tool", fc.Name)
-			result, createdHandoff := a.executeTool(fc.Name, fc.Args)
+			result, createdHandoff, emoji := a.executeTool(ctx, fc.Name, fc.Args)
 			if createdHandoff != nil {
 				reply.Handoffs = append(reply.Handoffs, *createdHandoff)
 			}
+			reply.Reaction = pickHigherPriorityReaction(reply.Reaction, emoji)
 			respParts = append(respParts, gemini.Part{
 				FunctionResponse: &gemini.FunctionResponse{
 					Name:     fc.Name,
@@ -165,6 +174,9 @@ func (a *Assistant) HandleMessage(ctx context.Context, sessionID, userText strin
 
 	if reply.Text == "" {
 		reply.Text = "Done. (No additional text returned.)"
+	}
+	if reply.Reaction == "" {
+		reply.Reaction = "👍"
 	}
 
 	now := time.Now().UTC()
@@ -290,7 +302,7 @@ func (a *Assistant) buildSystemPrompt() string {
 }
 
 func (a *Assistant) toolDeclarations() []gemini.FunctionDeclaration {
-	return []gemini.FunctionDeclaration{
+	decls := []gemini.FunctionDeclaration{
 		{
 			Name:        "list_tasks",
 			Description: "List tracked personal tasks and commitments.",
@@ -414,9 +426,23 @@ func (a *Assistant) toolDeclarations() []gemini.FunctionDeclaration {
 			Parameters:  map[string]any{"type": "OBJECT", "properties": map[string]any{}},
 		},
 	}
+
+	// Append vetted read-only MCP tools (if any MCP servers are connected).
+	for _, mt := range a.mcpMgr.Tools() {
+		desc := mt.Description
+		if desc == "" {
+			desc = fmt.Sprintf("Read-only MCP tool %s from server %s.", mt.Name, mt.Server)
+		}
+		decls = append(decls, gemini.FunctionDeclaration{
+			Name:        mt.ExposedName,
+			Description: "[Read-Only MCP: " + mt.Server + "] " + desc,
+			Parameters:  convertMCPSchemaToGemini(mt.InputSchema),
+		})
+	}
+	return decls
 }
 
-func (a *Assistant) executeTool(name string, args map[string]any) (map[string]any, *store.Handoff) {
+func (a *Assistant) executeTool(ctx context.Context, name string, args map[string]any) (map[string]any, *store.Handoff, string) {
 	strArg := func(k string) string {
 		if args == nil {
 			return ""
@@ -456,23 +482,27 @@ func (a *Assistant) executeTool(name string, args map[string]any) (map[string]an
 		}
 		tasks, err := a.store.ListTasks(status)
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"tasks": tasks, "count": len(tasks)}, nil
+		return map[string]any{"tasks": tasks, "count": len(tasks)}, nil, ""
 
 	case "add_task":
 		t, err := a.store.AddTask(strArg("title"), strArg("notes"), strArg("priority"), strArg("due"))
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"task": t}, nil
+		return map[string]any{"task": t}, nil, "🫡"
 
 	case "update_task":
 		t, err := a.store.UpdateTask(strArg("id"), strArg("status"), strArg("due"), strArg("notes"), strArg("priority"))
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"task": t}, nil
+		emoji := "👌"
+		if t.Status == "done" {
+			emoji = "🎉"
+		}
+		return map[string]any{"task": t}, nil, emoji
 
 	case "set_reminder":
 		loc, err := a.cfg.Location()
@@ -481,35 +511,35 @@ func (a *Assistant) executeTool(name string, args map[string]any) (map[string]an
 		}
 		r, err := a.store.AddReminder(strArg("message"), strArg("at"), loc)
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"reminder": r}, nil
+		return map[string]any{"reminder": r}, nil, "🫡"
 
 	case "list_reminders":
 		rems, err := a.store.ListReminders(false)
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"reminders": rems, "count": len(rems)}, nil
+		return map[string]any{"reminders": rems, "count": len(rems)}, nil, ""
 
 	case "cancel_reminder":
 		if err := a.store.CancelReminder(strArg("id")); err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"ok": true}, nil
+		return map[string]any{"ok": true}, nil, "👌"
 
 	case "append_memory":
 		if err := a.store.AppendMemory(strArg("entry")); err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"ok": true}, nil
+		return map[string]any{"ok": true}, nil, "👌"
 
 	case "log_note":
 		p, err := a.store.AppendJournal(strArg("note"))
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"ok": true, "path": p}, nil
+		return map[string]any{"ok": true, "path": p}, nil, "👌"
 
 	case "create_handoff":
 		h, err := a.store.CreateHandoff(
@@ -520,32 +550,100 @@ func (a *Assistant) executeTool(name string, args map[string]any) (map[string]an
 			strSliceArg("related_tasks"),
 		)
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
 		return map[string]any{
 			"handoff":        h,
 			"dashboard_url":  a.cfg.Antigravity.DashboardURL,
 			"instance_name":  a.cfg.Antigravity.InstanceName,
 			"pickup_command": fmt.Sprintf("%s %s", a.cfg.Antigravity.PickupSkill, h.ID),
-		}, &h
+		}, &h, "⚡"
 
 	case "list_handoffs":
 		hs, err := a.store.ListHandoffs(strArg("status"))
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"handoffs": hs, "count": len(hs)}, nil
+		return map[string]any{"handoffs": hs, "count": len(hs)}, nil, ""
 
 	case "get_quota":
 		summary, err := a.store.GetUsageSummary(time.Now(), a.cfg.Model, a.cfg.Quota.LimitForModel(a.cfg.Model))
 		if err != nil {
-			return map[string]any{"error": err.Error()}, nil
+			return map[string]any{"error": err.Error()}, nil, ""
 		}
-		return map[string]any{"quota": summary}, nil
+		return map[string]any{"quota": summary}, nil, ""
 
 	default:
-		return map[string]any{"error": fmt.Sprintf("unknown or disallowed tool %q", name)}, nil
+		if a.mcpMgr.HasTool(name) {
+			res, err := a.mcpMgr.Call(ctx, name, args)
+			if err != nil {
+				return map[string]any{"error": err.Error()}, nil, ""
+			}
+			return res, nil, "🤓"
+		}
+		return map[string]any{"error": fmt.Sprintf("unknown or disallowed tool %q", name)}, nil, ""
 	}
+}
+
+func pickHigherPriorityReaction(current, candidate string) string {
+	if candidate == "" {
+		return current
+	}
+	rank := func(e string) int {
+		switch e {
+		case "🎉":
+			return 5
+		case "⚡":
+			return 4
+		case "🫡":
+			return 3
+		case "🤓":
+			return 2
+		case "👌":
+			return 1
+		default:
+			return 0
+		}
+	}
+	if rank(candidate) >= rank(current) {
+		return candidate
+	}
+	return current
+}
+
+func convertMCPSchemaToGemini(schema map[string]any) map[string]any {
+	if len(schema) == 0 {
+		return map[string]any{"type": "OBJECT", "properties": map[string]any{}}
+	}
+	out := make(map[string]any, len(schema))
+	for k, v := range schema {
+		switch k {
+		case "type":
+			if s, ok := v.(string); ok {
+				out[k] = strings.ToUpper(s)
+			}
+		case "properties":
+			if props, ok := v.(map[string]any); ok {
+				cp := make(map[string]any, len(props))
+				for pk, pv := range props {
+					if pm, ok := pv.(map[string]any); ok {
+						cp[pk] = convertMCPSchemaToGemini(pm)
+					}
+				}
+				out[k] = cp
+			}
+		case "items":
+			if im, ok := v.(map[string]any); ok {
+				out[k] = convertMCPSchemaToGemini(im)
+			}
+		case "description", "required", "enum":
+			out[k] = v
+		}
+	}
+	if _, ok := out["type"]; !ok {
+		out["type"] = "OBJECT"
+	}
+	return out
 }
 
 func sanitizeID(s string) string {

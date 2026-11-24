@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"pregravity/internal/mcp"
 )
 
 // Schedule defines a recurring accountability or briefing check-in.
@@ -87,9 +89,10 @@ type Config struct {
 	Antigravity      AntigravityConfig `json:"antigravity"`
 	Telegram         TelegramConfig    `json:"telegram"`
 	Notify           NotifyConfig      `json:"notify"`
-	HTTP             HTTPConfig        `json:"http"`
-	Schedules        []Schedule        `json:"schedules"`
-	GeminiAPIKey     string            `json:"-"`
+	HTTP             HTTPConfig         `json:"http"`
+	Schedules        []Schedule         `json:"schedules"`
+	MCPServers       []mcp.ServerConfig `json:"mcp_servers,omitempty"`
+	GeminiAPIKey     string             `json:"-"`
 	TelegramBotToken string            `json:"-"`
 	NtfyToken        string            `json:"-"`
 	HTTPToken        string            `json:"-"`

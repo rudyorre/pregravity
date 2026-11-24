@@ -7,6 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,6 +25,8 @@ import (
 	"pregravity/internal/config"
 	"pregravity/internal/cron"
 	"pregravity/internal/gemini"
+	"pregravity/internal/gtasks"
+	"pregravity/internal/mcp"
 	"pregravity/internal/store"
 	"pregravity/internal/transport"
 	"pregravity/skills"
@@ -64,6 +69,10 @@ func main() {
 		err = cmdHandoffs(configPath, subArgs)
 	case "quota", "usage":
 		err = cmdQuota(configPath, subArgs)
+	case "mcp":
+		err = cmdMCP(configPath, subArgs)
+	case "gtasks":
+		err = cmdGTasks(configPath, subArgs)
 	case "install-skill":
 		err = cmdInstallSkill()
 	case "doctor":
@@ -99,6 +108,8 @@ Commands:
   tasks           Manage local tasks directly (list | add | done | snooze)
   handoffs        Manage Antigravity handoffs directly (list | create | show | done)
   quota           Show Gemini API usage/freebie quota & Antigravity sub quota (or set-limit <N>)
+  gtasks          Read-only Google Tasks setup & CLI (auth | list | enable)
+  mcp             Run built-in read-only MCP stdio servers (e.g. 'pregravity mcp gtasks')
   install-skill   Install the Antigravity /pickup skill to ~/.gemini/config/skills/pickup/
   doctor          Verify config, secret file permissions, data dir, and agy remote-control
   version         Print version`)
@@ -210,6 +221,10 @@ func cmdDaemon(configPath string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	mcpMgr := mcp.NewManager(ctx, cfg.MCPServers, logger)
+	defer mcpMgr.Close()
+	asst.SetMCPManager(mcpMgr)
 
 	var notifiers []transport.Notifier
 	var wg sync.WaitGroup
@@ -369,6 +384,9 @@ func cmdChat(configPath string, args []string) error {
 	asst := assistant.New(cfg, st, client, logger)
 
 	ctx := context.Background()
+	mcpMgr := mcp.NewManager(ctx, cfg.MCPServers, logger)
+	defer mcpMgr.Close()
+	asst.SetMCPManager(mcpMgr)
 	if strings.TrimSpace(*prompt) != "" {
 		reply, err := asst.HandleMessage(ctx, *sessionID, *prompt)
 		if err != nil {
@@ -738,7 +756,205 @@ func cmdDoctor(configPath string) error {
 		fmt.Println("[INFO] Telegram transport disabled")
 	}
 
+	enabledMCP := 0
+	for _, s := range cfg.MCPServers {
+		if s.Enabled {
+			enabledMCP++
+		}
+	}
+	fmt.Printf("[INFO] Read-only MCP servers enabled: %d\n", enabledMCP)
+
+	gtCreds := filepath.Join(filepath.Dir(configPath), "gtasks_credentials.json")
+	gtToken := filepath.Join(cfg.DataDir, "gtasks_token.json")
+	if _, err := os.Stat(gtToken); err == nil {
+		fmt.Printf("[OK]   Google Tasks read-only token present (%s)\n", gtToken)
+	} else if _, err := os.Stat(gtCreds); err == nil {
+		fmt.Printf("[WAIT] Google Tasks credentials found (%s) — run: pregravity gtasks auth\n", gtCreds)
+	} else {
+		fmt.Printf("[INFO] Google Tasks not configured (optional: place OAuth Desktop JSON at %s)\n", gtCreds)
+	}
+
 	return nil
+}
+
+func cmdMCP(configPath string, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: pregravity mcp <gtasks>")
+	}
+	if configPath == "" {
+		configPath = config.DefaultConfigPath()
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "gtasks":
+		credsPath := filepath.Join(filepath.Dir(configPath), "gtasks_credentials.json")
+		tokenPath := filepath.Join(cfg.DataDir, "gtasks_token.json")
+		cli := gtasks.NewClient(credsPath, tokenPath, "")
+		return gtasks.ServeStdioMCP(context.Background(), cli, os.Stdin, os.Stdout)
+	default:
+		return fmt.Errorf("unknown built-in mcp server %q (supported: gtasks)", args[0])
+	}
+}
+
+func cmdGTasks(configPath string, args []string) error {
+	if configPath == "" {
+		configPath = config.DefaultConfigPath()
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	credsPath := filepath.Join(filepath.Dir(configPath), "gtasks_credentials.json")
+	tokenPath := filepath.Join(cfg.DataDir, "gtasks_token.json")
+
+	sub := "list"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+
+	switch sub {
+	case "auth":
+		creds, err := gtasks.LoadCredentials(credsPath)
+		if err != nil {
+			return fmt.Errorf("%w\nDownload a Desktop OAuth Client JSON from Google Cloud Console (enable Google Tasks API) and save it to: %s", err, credsPath)
+		}
+		state := gtasks.RandomState()
+		redirectURI := "http://127.0.0.1:8789/callback"
+		authURL := gtasks.AuthURL(creds, redirectURI, state)
+
+		fmt.Println("Google Tasks Read-Only OAuth Setup (scope: tasks.readonly)")
+		fmt.Println("----------------------------------------------------------")
+		fmt.Println("1. Open this URL in your browser and approve read-only access:")
+		fmt.Println()
+		fmt.Println(authURL)
+		fmt.Println()
+
+		codeCh := make(chan string, 1)
+		ln, listenErr := net.Listen("tcp", "127.0.0.1:8789")
+		if listenErr == nil {
+			srv := &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Query().Get("state") != state {
+						http.Error(w, "invalid state", http.StatusBadRequest)
+						return
+					}
+					if code := r.URL.Query().Get("code"); code != "" {
+						_, _ = fmt.Fprintln(w, "Pregravity Google Tasks read-only auth complete! You can close this tab.")
+						select {
+						case codeCh <- code:
+						default:
+						}
+					}
+				}),
+			}
+			go func() { _ = srv.Serve(ln) }()
+			defer srv.Close()
+		}
+
+		fmt.Print("2. If on a remote devbox without local browser forwarding, paste the full redirected URL (or `code` param) here and press Enter: ")
+		go func() {
+			sc := bufio.NewScanner(os.Stdin)
+			if sc.Scan() {
+				raw := strings.TrimSpace(sc.Text())
+				if raw == "" {
+					return
+				}
+				if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+					if u, err := url.Parse(raw); err == nil {
+						if c := u.Query().Get("code"); c != "" {
+							raw = c
+						}
+					}
+				}
+				select {
+				case codeCh <- raw:
+				default:
+				}
+			}
+		}()
+
+		code := <-codeCh
+		tok, err := gtasks.ExchangeCode(context.Background(), creds, code, redirectURI, nil)
+		if err != nil {
+			return err
+		}
+		if err := gtasks.SaveToken(tokenPath, tok); err != nil {
+			return err
+		}
+		fmt.Printf("\nSaved read-only Google Tasks token (0600): %s\n", tokenPath)
+		fmt.Println("Next: run `pregravity gtasks enable` to wire the read-only gtasks MCP server into Gravy.")
+		return nil
+
+	case "enable":
+		exePath, err := os.Executable()
+		if err != nil {
+			home, _ := os.UserHomeDir()
+			exePath = filepath.Join(home, ".local", "bin", "pregravity")
+		}
+		found := false
+		for i := range cfg.MCPServers {
+			if cfg.MCPServers[i].Name == "gtasks" {
+				cfg.MCPServers[i].Enabled = true
+				cfg.MCPServers[i].Transport = "stdio"
+				cfg.MCPServers[i].Command = exePath
+				cfg.MCPServers[i].Args = []string{"mcp", "gtasks"}
+				found = true
+				break
+			}
+		}
+		if !found {
+			ro := true
+			cfg.MCPServers = append(cfg.MCPServers, mcp.ServerConfig{
+				Name:      "gtasks",
+				Enabled:   true,
+				Transport: "stdio",
+				Command:   exePath,
+				Args:      []string{"mcp", "gtasks"},
+				ReadOnly:  &ro,
+			})
+		}
+		if err := config.Save(configPath, cfg); err != nil {
+			return err
+		}
+		fmt.Printf("Enabled built-in read-only gtasks MCP server in %s\n", configPath)
+		fmt.Println("Restart daemon to activate: systemctl --user restart pregravity.service")
+		return nil
+
+	case "list":
+		cli := gtasks.NewClient(credsPath, tokenPath, "")
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		lists, err := cli.ListTaskLists(ctx)
+		if err != nil {
+			return err
+		}
+		for _, l := range lists {
+			fmt.Printf("== %s (%s) ==\n", l.Title, l.ID)
+			items, err := cli.ListTasks(ctx, l.ID, false)
+			if err != nil {
+				fmt.Printf("  error: %v\n", err)
+				continue
+			}
+			if len(items) == 0 {
+				fmt.Println("  (no open tasks)")
+				continue
+			}
+			for _, it := range items {
+				due := ""
+				if it.Due != "" {
+					due = " (due " + it.Due + ")"
+				}
+				fmt.Printf("  - %s%s\n", it.Title, due)
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown gtasks subcommand %q (expected: auth, enable, list)", sub)
+	}
 }
 
 func detectAgyInstanceName() string {

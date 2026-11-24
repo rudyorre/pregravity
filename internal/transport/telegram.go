@@ -130,11 +130,12 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID, replyToMsgID in
 	// Fast local slash commands that don't burn API tokens.
 	switch {
 	case text == "/help" || text == "/start":
+		_ = b.SetReaction(ctx, chatID, replyToMsgID, "👌")
 		_ = b.SendReply(ctx, chatID, replyToMsgID, strings.Join([]string{
 			"**Pregravity** — Personal Accountability & Antigravity Handoff Assistant",
 			"",
 			"Commands:",
-			"- `/tasks` — list open tasks (no API tokens)",
+			"- `/tasks [open|done|all]` — list tasks (no API tokens)",
 			"- `/handoffs` — list open Antigravity handoffs",
 			"- `/handoff <title> | <goal>` — immediately stage a handoff for agy",
 			"- `/quota` — show Gemini API daily usage & remaining freebie budget (no API tokens)",
@@ -143,6 +144,7 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID, replyToMsgID in
 		return
 
 	case text == "/quota" || text == "/usage":
+		_ = b.SetReaction(ctx, chatID, replyToMsgID, "👌")
 		summary, err := b.st.GetUsageSummary(time.Now(), b.cfg.Model, b.cfg.Quota.LimitForModel(b.cfg.Model))
 		if err != nil {
 			_ = b.SendReply(ctx, chatID, replyToMsgID, "Error reading usage: "+err.Error())
@@ -152,24 +154,36 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID, replyToMsgID in
 		_ = b.SendReply(ctx, chatID, replyToMsgID, msg)
 		return
 
-	case text == "/tasks":
-		tasks, err := b.st.ListTasks("open")
+	case text == "/tasks" || strings.HasPrefix(text, "/tasks "):
+		status := "open"
+		if rest := strings.TrimSpace(strings.TrimPrefix(text, "/tasks")); rest != "" {
+			status = rest
+		}
+		tasks, err := b.st.ListTasks(status)
 		if err != nil {
+			_ = b.SetReaction(ctx, chatID, replyToMsgID, "😢")
 			_ = b.SendReply(ctx, chatID, replyToMsgID, "Error reading tasks: "+err.Error())
 			return
 		}
+		_ = b.SetReaction(ctx, chatID, replyToMsgID, "👌")
 		if len(tasks) == 0 {
-			_ = b.SendReply(ctx, chatID, replyToMsgID, "No open tasks.")
+			_ = b.SendReply(ctx, chatID, replyToMsgID, fmt.Sprintf("No %s tasks.", status))
 			return
 		}
 		var sb strings.Builder
-		sb.WriteString("**Open tasks:**\n")
+		fmt.Fprintf(&sb, "**Tasks (%s):**\n", status)
 		for _, t := range tasks {
 			due := ""
 			if t.Due != "" {
 				due = " *(due " + t.Due + ")*"
 			}
-			fmt.Fprintf(&sb, "- `%s` **[%s]** %s%s\n", t.ID, t.Priority, t.Title, due)
+			icon := "⬜"
+			if t.Status == "done" {
+				icon = "✅"
+			} else if t.Status == "snoozed" {
+				icon = "💤"
+			}
+			fmt.Fprintf(&sb, "%s `%s` **[%s]** %s%s\n", icon, t.ID, t.Priority, t.Title, due)
 		}
 		_ = b.SendReply(ctx, chatID, replyToMsgID, sb.String())
 		return
@@ -177,9 +191,11 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID, replyToMsgID in
 	case text == "/handoffs":
 		hs, err := b.st.ListHandoffs("open")
 		if err != nil {
+			_ = b.SetReaction(ctx, chatID, replyToMsgID, "😢")
 			_ = b.SendReply(ctx, chatID, replyToMsgID, "Error reading handoffs: "+err.Error())
 			return
 		}
+		_ = b.SetReaction(ctx, chatID, replyToMsgID, "👌")
 		if len(hs) == 0 {
 			_ = b.SendReply(ctx, chatID, replyToMsgID, "No open Antigravity handoffs.")
 			return
@@ -202,9 +218,11 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID, replyToMsgID in
 		}
 		h, err := b.st.CreateHandoff(strings.TrimSpace(title), strings.TrimSpace(goal), "Created manually via Telegram /handoff.", "", nil)
 		if err != nil {
+			_ = b.SetReaction(ctx, chatID, replyToMsgID, "😢")
 			_ = b.SendReply(ctx, chatID, replyToMsgID, "Could not create handoff: "+err.Error())
 			return
 		}
+		_ = b.SetReaction(ctx, chatID, replyToMsgID, "⚡")
 		msg := fmt.Sprintf("**Handoff staged:** %s\nOpen %s (`%s`) and paste the pickup command below:",
 			h.Title, b.cfg.Antigravity.DashboardURL, b.cfg.Antigravity.InstanceName)
 		_ = b.SendReply(ctx, chatID, replyToMsgID, msg)
@@ -213,16 +231,24 @@ func (b *TelegramBot) handleMessage(ctx context.Context, chatID, replyToMsgID in
 		return
 	}
 
+	// Instant "instinct" acknowledgement while Gravy processes the turn (0 API tokens).
+	_ = b.SetReaction(ctx, chatID, replyToMsgID, "👀")
+	_ = b.SendTyping(ctx, chatID)
+
 	sessionID := fmt.Sprintf("tg-%d", chatID)
 	reply, err := b.asst.HandleMessage(ctx, sessionID, text)
 	if err != nil {
 		b.logger.Error("assistant error on telegram message", "chat_id", chatID, "err", err)
+		_ = b.SetReaction(ctx, chatID, replyToMsgID, "😢")
 		_ = b.SendReply(ctx, chatID, replyToMsgID, "Error: "+err.Error())
 		return
 	}
+	if reply.Reaction != "" {
+		_ = b.SetReaction(ctx, chatID, replyToMsgID, reply.Reaction)
+	}
 	_ = b.SendReply(ctx, chatID, replyToMsgID, reply.Text)
 
-	// Mobile accessibility: whenever Grav stages one or more Antigravity handoffs,
+	// Mobile accessibility: whenever Gravy stages one or more Antigravity handoffs,
 	// follow up with a standalone copy-ready `/pickup <id>` message (one-tap copy on Telegram mobile).
 	for _, h := range reply.Handoffs {
 		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("`%s %s`", b.cfg.Antigravity.PickupSkill, h.ID))
@@ -271,6 +297,68 @@ func (b *TelegramBot) SendReply(ctx context.Context, chatID, replyToMsgID int64,
 			return err
 		}
 	}
+	return nil
+}
+
+// SetReaction sets (or clears when emoji=="") a single emoji reaction on messageID.
+func (b *TelegramBot) SetReaction(ctx context.Context, chatID, messageID int64, emoji string) error {
+	if messageID <= 0 {
+		return nil
+	}
+	reaction := []map[string]string{}
+	if strings.TrimSpace(emoji) != "" {
+		reaction = append(reaction, map[string]string{
+			"type":  "emoji",
+			"emoji": emoji,
+		})
+	}
+	raw, err := json.Marshal(map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"reaction":   reaction,
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s/bot%s/setMessageReaction", b.apiBase, b.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16<<10))
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("telegram setMessageReaction HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// SendTyping sends a "typing" chat action indicator (best-effort).
+func (b *TelegramBot) SendTyping(ctx context.Context, chatID int64) error {
+	raw, err := json.Marshal(map[string]any{
+		"chat_id": chatID,
+		"action":  "typing",
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s/bot%s/sendChatAction", b.apiBase, b.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
 	return nil
 }
 

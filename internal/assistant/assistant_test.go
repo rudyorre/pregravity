@@ -121,9 +121,12 @@ func TestAssistantToolLoopAndHandoff(t *testing.T) {
 	}
 
 	// Verify unknown/shell tool calls are rejected cleanly.
-	res, _ := asst.executeTool("run_shell_command", map[string]any{"cmd": "rm -rf /"})
+	res, _, _ := asst.executeTool(context.Background(), "run_shell_command", map[string]any{"cmd": "rm -rf /"})
 	if _, ok := res["error"]; !ok {
 		t.Fatalf("expected disallowed tool to return error, got %+v", res)
+	}
+	if reply.Reaction != "⚡" {
+		t.Fatalf("expected handoff reaction ⚡, got %q", reply.Reaction)
 	}
 }
 

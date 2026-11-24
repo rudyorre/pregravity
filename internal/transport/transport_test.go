@@ -160,4 +160,18 @@ func TestTelegramSendReplyHTMLFallbackAndReplyParameters(t *testing.T) {
 	if _, hasParseMode := requests[2]["parse_mode"]; hasParseMode {
 		t.Fatalf("expected fallback retry to omit parse_mode, got %v", requests[2]["parse_mode"])
 	}
+
+	// Verify SetReaction sends exact Telegram setMessageReaction payload.
+	if err := bot.SetReaction(context.Background(), 42, 777, "🎉"); err != nil {
+		t.Fatalf("set reaction: %v", err)
+	}
+	last := requests[len(requests)-1]
+	reacList, ok := last["reaction"].([]any)
+	if !ok || len(reacList) != 1 {
+		t.Fatalf("unexpected reaction payload: %#v", last)
+	}
+	r0 := reacList[0].(map[string]any)
+	if r0["type"] != "emoji" || r0["emoji"] != "🎉" {
+		t.Fatalf("unexpected reaction item: %#v", r0)
+	}
 }
