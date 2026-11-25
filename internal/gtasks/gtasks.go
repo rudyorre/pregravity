@@ -123,7 +123,7 @@ func normalizeCreds(c Credentials) Credentials {
 		c.TokenURI = "https://oauth2.googleapis.com/token"
 	}
 	if c.RedirectURI == "" {
-		c.RedirectURI = "http://127.0.0.1:8789/callback"
+		c.RedirectURI = "http://127.0.0.1:8789"
 	}
 	return c
 }

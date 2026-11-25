@@ -842,7 +842,7 @@ func cmdGTasks(configPath string, args []string) error {
 			scopeLabel = "tasks.readonly"
 		}
 		state := gtasks.RandomState()
-		redirectURI := "http://127.0.0.1:8789/callback"
+		redirectURI := "http://127.0.0.1:8789"
 		authURL := gtasks.AuthURL(creds, redirectURI, state, scope)
 
 		fmt.Printf("Google Tasks OAuth Setup (scope: %s)\n", scopeLabel)
